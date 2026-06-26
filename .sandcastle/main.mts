@@ -73,7 +73,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         branchStrategy: { type: "branch", branch: issue.branch },
         name: "implementer",
         maxIterations: 100,
-        idleTimeoutSeconds: 3600,
+        idleTimeoutSeconds: 14400,
         agent: sandcastle.opencode("opencode-go/minimax-m3"),
         promptFile: "./.sandcastle/implement-prompt.md",
         promptArgs: {
@@ -131,7 +131,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     sandbox: docker(),
     name: "merger",
     maxIterations: 1,
-    idleTimeoutSeconds: 3600,
+    idleTimeoutSeconds: 7200,
     agent: sandcastle.opencode("opencode-go/minimax-m3"),
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
