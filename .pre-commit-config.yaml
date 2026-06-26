@@ -1,0 +1,151 @@
+# ---------------------------------------------------------------------------
+# .pre-commit-config.yaml – local mirror of the CI pipeline.
+#
+# Running `pre-commit run` on a developer's machine executes the same
+# checks that `.github/workflows/ci.yml` runs in the cloud, so a
+# contributor catches lint / typecheck / format drift before pushing
+# instead of after a red CI build. CODING_STANDARDS.md §8 documents
+# the workflow.
+#
+# Usage:
+#   pip install pre-commit
+#   make precommit-install   # installs the git hook in .git/hooks/
+#   make precommit-run       # runs every hook against the working tree
+#
+# The hooks are pinned by `rev:` so a contributor can keep working
+# offline once `pre-commit` has cached the hook repos. CI runs
+# the framework in the `precommit` job of `.github/workflows/ci.yml`
+# (`pre-commit run --all-files`); the local hook installed via
+# `make precommit-install` is the primary surface for the 80%
+# case, the CI job is the canonical "is the whole tree clean?"
+# gate that catches drift when a contributor skipped the local
+# hook.
+# ---------------------------------------------------------------------------
+
+# `fail_fast: false` keeps every hook running even if an earlier one
+# fails – this surfaces *all* the drift in one pass instead of forcing
+# the contributor to fix-run-rerun in a loop.
+fail_fast: false
+
+# The minimum supported pre-commit version. `3.5.0` is the lowest
+# release that ships the `language: system` hook improvements the
+# Ruff / Mypy hooks rely on. Pin it explicitly so contributors on
+# older versions get a clean error message rather than a cryptic
+# crash.
+minimum_pre_commit_version: "3.5.0"
+
+# Top-level `repos:` lists the hook repos in execution order. Each
+# entry declares the source of the hook and the hooks it contributes.
+repos:
+  # ------------------------------------------------------------------------
+  # Standard hygiene hooks. The `pre-commit-hooks` repo is the
+  # de-facto baseline maintained by the pre-commit project itself;
+  # every entry here is a tiny, dependency-free check that runs in
+  # milliseconds and prevents the most common formatting noise from
+  # ever landing on a PR.
+  # ------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Strip trailing whitespace. Editors that don't honour
+      # `.editorconfig` (or that have a stale config) silently add
+      # it; this hook is the safety net.
+      - id: trailing-whitespace
+        # Markdown uses two trailing spaces as a hard line break;
+        # leave those alone.
+        args: [--markdown-linebreak-ext=md]
+      # Ensure every file ends with exactly one newline.
+      - id: end-of-file-fixer
+      # YAML is everywhere in this repo (compose, CI, pre-commit
+      # itself, dependabot). A typo here would be caught much later
+      # than at the matching fixture test.
+      - id: check-yaml
+        # `exclude: ^frontend/package-lock\.json$` is required
+        # because the Angular CLI's lockfile is not strictly valid
+        # YAML (top-level value is a single string), and the
+        # check-yaml hook would otherwise flag it.
+        exclude: ^frontend/package-lock\.json$
+      # Same idea for TOML (backend/pyproject.toml).
+      - id: check-toml
+      # Prevent giant files (lockfiles, generated bundles) from
+      # being committed by accident.
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      # Block merge conflict markers (`<<<<<<<`, `=======`,
+      # `>>>>>>>`) from ever landing in a commit.
+      - id: check-merge-conflict
+
+  # ------------------------------------------------------------------------
+  # Ruff – Python linter + formatter.
+  # The same Ruff binary that `make backend-lint` invokes is what
+  # runs here; the only difference is that the hook version is
+  # pinned (so every contributor runs the same revision) and the
+  # command mirrors what CI does. `args:` pass through the same
+  # flags the Makefile target uses.
+  # ------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      # `ruff` runs the linter with `--fix` so trivial issues
+      # (unused imports, missing newlines, etc.) are auto-corrected
+      # before the commit lands. The `args` are kept identical to
+      # the `make backend-lint` invocation so a local `pre-commit
+      # run` and a CI `ruff check .` see exactly the same rules.
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [python, pyi]
+      # `ruff-format` enforces the same Black-compatible style the
+      # backend adopts (see backend/pyproject.toml `[tool.ruff]`).
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # ------------------------------------------------------------------------
+  # Mypy – static type checker.
+  # The hook runs `mypy` from the local virtualenv (`language:
+  # system`) instead of installing a fresh Mypy per hook run;
+  # the project's `requirements-dev.txt` already pins the version.
+  # `additional_dependencies` is left empty on purpose so the hook
+  # uses whatever Mypy the developer has installed.
+  # ------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (backend)
+        # `system` means the hook runs the binary already on
+        # $PATH (or the one declared by `make backend-typecheck`).
+        # Skipping if Mypy isn't installed is the right behaviour:
+        # CI is the source of truth, the hook is a fast-feedback
+        # nicety.
+        language: system
+        # `types: [python]` is what pre-commit uses to skip the
+        # hook on non-Python files; the project also runs Mypy on
+        # `tests/` via `backend/pyproject.toml`, so the
+        # `exclude:` list is intentionally empty.
+        types: [python]
+        # The exact `cd backend && mypy` mirrors the Makefile
+        # target and the `backend` CI job so every surface that
+        # type-checks the code agrees on the command.
+        entry: bash -c 'cd backend && mypy'
+
+  # ------------------------------------------------------------------------
+  # ESLint – TypeScript / Angular linter.
+  # Mirrors `make frontend-lint`. `language: system` is correct
+  # here: `npm` is expected on $PATH and the hook just shells out
+  # to the same command the Makefile target uses.
+  # ------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: eslint
+        name: eslint (frontend)
+        language: system
+        # `types:` does not work here: pre-commit's built-in type
+        # detection recognises `javascript` and a handful of other
+        # well-known types, but not `ts` / `tsx`. Using `ts` here
+        # would silently match nothing and the hook would report
+        # "no files to check" on every commit, hiding regressions.
+        # `files:` is a regex against the relative path; mirroring
+        # `lintFilePatterns` from `frontend/angular.json`
+        # (`src/**/*.ts`, `src/**/*.html`) keeps the hook trigger
+        # in lockstep with the Angular lint target.
+        files: '\.(ts|tsx|js|jsx|html)$'
+        entry: bash -c 'cd frontend && npm run lint --silent'

@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# Issue template chooser for the Message Gateway repository.
+#
+# GitHub renders this file as the *New issue* picker; the entries
+# below populate the cards the user sees when they click
+# *New issue*. Each entry is a button that opens one of the
+# Markdown templates in the same directory.
+#
+# `external` links are not used; every option is a first-class
+# template so the issue form is self-contained.
+# ---------------------------------------------------------------------------
+
+blank_issues_enabled: true
+
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/msg-gateway/message-gateway/security/advisories/new
+    about: |
+      **Please use this channel** (or email `security@msg-gateway.example.com`)
+      to report security vulnerabilities. The bug-report template below
+      creates a *public* issue; do not paste exploit payloads there.
+  - name: Discussions / Q&A
+    url: https://github.com/msg-gateway/message-gateway/discussions
+    about: |
+      General questions, RFCs and idea-shaping that are not yet a
+      concrete feature request.
+  - name: Contributing guide
+    url: https://github.com/msg-gateway/message-gateway/blob/main/CONTRIBUTING.md
+    about: |
+      Branching, commit conventions, and how to run the test suite
+      before opening a PR.

@@ -1,11 +1,7 @@
-node_modules/
-dist/
-.angular/
-.env
-*.log
-.DS_Store
+# Backend artefacts
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -13,8 +9,10 @@ htmlcov/
 .venv-test/
 .venv-*/
 venv/
-.idea/
-.vscode/
 .mypy_cache/
 .ruff_cache/
-*.egg-info/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

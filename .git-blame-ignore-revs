@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# .git-blame-ignore-revs – revisions `git blame` should skip.
+#
+# `git blame` walks the history of a file line by line. Big-bang
+# refactors (a project-wide re-format, a license header pass, a
+# tooling migration) touch almost every line in the repository and
+# drown the actual authorship signal in noise. The standard remedy
+# is to list those revisions here and configure git to consult the
+# file:
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Modern versions of `git` (>= 2.23) honour the file automatically
+# when it lives at the repository root, so no per-developer setup
+# is required.
+#
+# Conventions:
+#   * One full SHA per line.
+#   * Lines starting with `#` are comments and are ignored.
+#   * New entries must be added *after* a format / migration commit
+#     lands on the branch; pre-emptively adding future SHAs is a
+#     footgun (rebase rewrites them).
+# ---------------------------------------------------------------------------
+
+# Apply Ruff format across the backend and tighten the pre-commit
+# ESLint hook filter so it actually matches frontend sources. The
+# change is mechanical (whitespace + import ordering) and would
+# otherwise dominate `git blame` output for every Python file in
+# `backend/`.
+fbc219f4c73582476e85e4b0872fafb897141e2d

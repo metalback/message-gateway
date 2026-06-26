@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Message Gateway – frontend .dockerignore
+#
+# The builder stage does `COPY . .` after `npm install`, so anything
+# listed here never reaches the build context. This avoids uploading
+# the host's node_modules / .angular cache and keeps editor / log
+# noise out of the image.
+# ---------------------------------------------------------------------------
+
+# --- Version control -------------------------------------------------------
+.git
+.gitignore
+
+# --- Node / Angular build artefacts --------------------------------------
+node_modules
+dist
+.angular
+coverage
+.nx
+*.tsbuildinfo
+
+# --- Test / coverage output ----------------------------------------------
+karma-*
+junit-*
+*.lcov
+
+# --- Editor / OS noise ---------------------------------------------------
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# --- Local secrets & logs -------------------------------------------------
+.env
+.env.*
+*.log
+
+# --- Docker meta ----------------------------------------------------------
+Dockerfile
+.dockerignore
+nginx.conf

@@ -1,0 +1,120 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Message Gateway – local development stack.
+#
+# Services:
+#   - postgres    : primary database
+#   - redis       : queue + cache + rate limiting
+#   - backend     : FastAPI REST API
+#   - frontend    : Angular dashboard (dev server with live reload)
+# ---------------------------------------------------------------------------
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Stop & remove volumes:
+#   docker compose down -v
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: msg-gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - msg-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: msg-gateway-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - msg-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: msg-gateway-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # The FastAPI service exposes a liveness endpoint at `/health`
+    # (see backend/app/main.py) which answers without touching
+    # external dependencies. Using a Python one-liner keeps the
+    # healthcheck independent of `curl` / `wget`, which the
+    # `python:3.12-slim` base image does not ship with. `start_period`
+    # gives uvicorn enough headroom to import the app on the first
+    # boot (the volume bind mount forces a full module load).
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - msg-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: ${API_BASE_URL}
+    container_name: msg-gateway-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "4200:80"
+    networks:
+      - msg-net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  msg-net:
+    driver: bridge

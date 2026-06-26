@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# Message Gateway – backend project metadata & tool configuration.
+#
+# The package itself is declared implicitly via the `app/` directory
+# containing an `__init__.py`. This file centralises the tool
+# configuration (Ruff, Mypy) so contributors don't have to chase
+# `setup.cfg` / `tox.ini` / `pyproject.toml` separately.
+# ---------------------------------------------------------------------------
+
+[project]
+name = "msg-gateway-backend"
+version = "0.1.0"
+description = "Message Gateway – FastAPI backend (SMS + WhatsApp API)."
+requires-python = ">=3.11"
+
+# ---------------------------------------------------------------------------
+# Ruff – linter & formatter.
+# Kept in sync with `make backend-lint` (see root `Makefile`).
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["alembic", "build", "dist"]
+
+[tool.ruff.lint]
+# Reasonable starter set; tightened in follow-up tasks.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "B008",  # FastAPI uses function calls in argument defaults a lot
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # `assert False` is fine in tests
+
+# ---------------------------------------------------------------------------
+# Mypy – static type checker.
+# The PRD and CODING_STANDARDS.md §2 ask for `mypy` as part of CI; the
+# config below is intentionally permissive (gradual typing) so the
+# scaffold passes type-check before any domain code lands.
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "."
+files = ["app", "tests"]
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+exclude = ["alembic/", "build/", "dist/"]
+
+# Per-module overrides: the placeholder modules (routes, adapters,
+# observability) ship with stubs that intentionally do nothing yet,
+# so we silence "empty body" warnings for them.
+[[tool.mypy.overrides]]
+module = ["app.routes.*", "app.adapters.*", "app.observability.*"]
+allow_untyped_defs = true

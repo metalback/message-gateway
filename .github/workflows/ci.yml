@@ -1,0 +1,158 @@
+name: ci
+
+# ---------------------------------------------------------------------------
+# Message Gateway – continuous integration.
+#
+# Jobs:
+#   - backend   : ruff + mypy + pytest for the FastAPI service.
+#   - frontend  : eslint + karma + production build (tsc) for Angular.
+#   - compose   : `docker compose config` validation.
+#   - precommit : `pre-commit run --all-files` for the full hygiene +
+#                 formatting surface (also exercises Ruff / Mypy /
+#                 ESLint through the framework, not the raw CLIs).
+#
+# Each job sets its own `working-directory` so steps run inside
+# `backend/` or `frontend/` while the checkout stays at the repo
+# root (the workflow file lives at `.github/workflows/`).
+# ---------------------------------------------------------------------------
+#
+# Triggers:
+#   - pull_request: any change targeting main / a feature branch.
+#   - push:        any push to main.
+# ---------------------------------------------------------------------------
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (lint + typecheck + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Run tests
+        run: pytest
+
+      - name: Upload coverage artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/.coverage
+          retention-days: 7
+
+  frontend:
+    name: Frontend (lint + build + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        env:
+          API_BASE_URL: /api
+        run: npm run build -- --configuration=production
+
+      - name: Test
+        run: npm test -- --watch=false --browsers=ChromeHeadlessCI
+
+  compose:
+    name: docker-compose validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: docker compose -f docker-compose.yml config --quiet
+
+  # ---------------------------------------------------------------------------
+  # pre-commit: run the framework itself, not just the individual tools.
+  # The local `pre-commit install` hook is the primary surface for
+  # contributors (see CODING_STANDARDS.md §8) but a CI run provides
+  # the canonical "clean tree" answer: any drift that escapes the
+  # developer hook is still caught here. The standard hygiene hooks
+  # (trailing-whitespace, end-of-file-fixer, check-yaml, check-toml,
+  # check-added-large-files, check-merge-conflict) are not duplicated
+  # by the backend / frontend jobs, so this is the only CI surface
+  # that exercises them.
+  # ---------------------------------------------------------------------------
+  precommit:
+    name: Pre-commit framework
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # `pre-commit` is pinned in backend/requirements-dev.txt;
+          # caching on the requirements file mirrors the backend job
+          # so the `pip install` step is skipped when nothing has
+          # changed.
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install pre-commit
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Cache pre-commit hook environments
+        # `pre-commit` materialises every hook repo into a virtualenv
+        # under `~/.cache/pre-commit`. Restoring that cache on
+        # subsequent runs avoids the multi-minute cold-start cost of
+        # downloading + installing the Ruff and ESLint hook envs.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-
+
+      - name: Run pre-commit against the whole tree
+        # `--show-diff-on-failure` makes the failing files visible
+        # in the run log without having to clone the branch locally.
+        # `--all-files` is the right scope here: CI checks the entire
+        # tree, not just the files touched by the most recent commit.
+        run: pre-commit run --all-files --show-diff-on-failure

@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Message Gateway – backend .dockerignore
+#
+# The runtime stage does `COPY . /app`, so anything listed here never
+# reaches the image. This keeps dev / test artefacts, virtualenvs, and
+# editor noise out of the production layer.
+# ---------------------------------------------------------------------------
+
+# --- Version control -------------------------------------------------------
+.git
+.gitignore
+
+# --- Python bytecode & caches --------------------------------------------
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.mypy_cache
+.ruff_cache
+
+# --- Test artefacts -------------------------------------------------------
+.pytest_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+junit*.xml
+tests
+
+# --- Virtualenvs & local installs ----------------------------------------
+.venv
+venv
+env
+.python-version
+pip-wheel-metadata
+
+# --- Editor / OS noise ---------------------------------------------------
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo
+
+# --- Local secrets & logs -------------------------------------------------
+.env
+.env.*
+*.log
+
+# --- Docker meta ----------------------------------------------------------
+Dockerfile
+.dockerignore

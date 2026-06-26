@@ -1,0 +1,111 @@
+# ---------------------------------------------------------------------------
+# .gitattributes – per-path git attributes for the Message Gateway monorepo.
+#
+# Goals:
+#   1. Normalise line endings so the same diff renders identically on
+#      Windows, macOS and Linux dev machines. Shell scripts, Dockerfiles,
+#      Python and YAML are LF-only; the few .bat / .cmd files Windows
+#      developers may add are kept CRLF-native.
+#   2. Mark binary blobs so git never tries to compute textual diffs on
+#      them and tooling like grep treats them as opaque.
+#   3. Keep the file small and obviously incomplete on purpose – the
+#      defaults below are the same ones GitHub, GitLab and `git init`
+#      ship with; they are the lowest common denominator that prevents
+#      cross-platform surprises.
+# ---------------------------------------------------------------------------
+
+# --- Default: LF, text -----------------------------------------------------
+# Treat every text file as LF. The `text` attribute is what makes git
+# store the content with LF in the object database and convert to the
+# platform native EOL on checkout. A leading `-text` reverts specific
+# patterns (see Shell / Windows sections below) where the platform
+# expects a different convention.
+*               text=auto eol=lf
+
+# --- Source: enforce LF even on platforms that try to convert -------------
+# `eol=lf` is a stronger guarantee than `text`: it forces LF in the
+# index regardless of `core.autocrlf`. We apply it to the source files
+# CI actually compiles, so a stray CRLF is caught in code review.
+*.py            text eol=lf
+*.pyi           text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.js            text eol=lf
+*.jsx           text eol=lf
+*.mjs           text eol=lf
+*.cjs           text eol=lf
+*.html          text eol=lf
+*.css           text eol=lf
+*.scss          text eol=lf
+*.json          text eol=lf
+*.jsonc         text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+*.sh            text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+*.conf          text eol=lf
+Dockerfile      text eol=lf
+*.dockerignore  text eol=lf
+*.gitignore     text eol=lf
+*.gitattributes text eol=lf
+*.editorconfig  text eol=lf
+LICENSE         text eol=lf
+
+# --- Generated / vendored – no diff, no merge, no end-of-line fix ----------
+# Lockfiles and compile outputs are reproducible; rewriting line endings
+# would change the bytes of a generated file and break the hash the
+# downstream tool expects.
+package-lock.json  text eol=lf -diff
+yarn.lock          text eol=lf -diff
+pnpm-lock.yaml     text eol=lf -diff
+composer.lock      text eol=lf -diff
+Gemfile.lock       text eol=lf -diff
+poetry.lock        text eol=lf -diff
+Pipfile.lock       text eol=lf -diff
+*.min.js           binary
+*.min.css          binary
+*.map              binary -diff
+*.tsbuildinfo      binary
+backend/.coverage  binary
+backend/.coverage.* binary
+*.lcov             text eol=lf
+
+# --- Binary blobs (images, fonts, archives) --------------------------------
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.avif  binary
+*.pdf   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.tgz   binary
+*.bz2   binary
+*.7z    binary
+*.rar   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.mp4   binary
+*.mov   binary
+*.mp3   binary
+*.wav   binary
+
+# --- Shell scripts that must stay POSIX (no shebang auto-conversion) ------
+*.sh  text eol=lf
+
+# --- Windows-only batch files (intentionally CRLF) -------------------------
+# `.bat` / `.cmd` / `.ps1` on Windows rely on CRLF; `core.autocrlf`
+# would otherwise strip the carriage return and break them. Override
+# the default for these patterns only.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf

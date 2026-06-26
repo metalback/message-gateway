@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# EditorConfig: cross-editor formatting defaults for Message Gateway.
+#
+# Most editors (VSCode, IntelliJ, Sublime, vim with a plugin, …) honour
+# this file out of the box. The settings here mirror the conventions
+# documented in CODING_STANDARDS.md.
+# ---------------------------------------------------------------------------
+
+root = true
+
+# --- Python (backend) -------------------------------------------------------
+[*.py]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+max_line_length = 100
+
+# --- TypeScript / HTML / SCSS (frontend) ------------------------------------
+[*.{ts,tsx,js,jsx,mjs,cjs,html,scss,css}]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+max_line_length = 100
+
+# --- JSON / YAML / TOML (config files) --------------------------------------
+[*.{json,jsonc,yml,yaml,toml}]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# --- Markdown ---------------------------------------------------------------
+[*.md]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = false
+insert_final_newline = true
+
+# --- Shell / Makefile --------------------------------------------------------
+# Makefiles require literal tabs at the start of recipe lines; never
+# normalise them to spaces.
+[Makefile]
+indent_style = tab
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.sh]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# --- Dockerfiles -------------------------------------------------------------
+[Dockerfile*]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true

@@ -1,0 +1,152 @@
+# ---------------------------------------------------------------------------
+# Dependabot configuration for the Message Gateway monorepo.
+#
+# We declare one update per ecosystem (pip / npm / docker / github-actions)
+# so each one can be tuned independently – the pip ecosystem reads from
+# `backend/requirements*.txt`, the npm ecosystem reads `frontend/package.json`
+# and `frontend/package-lock.json`, and the docker ecosystems pin the base
+# images declared in the compose stack.
+#
+# Why this matters: every release of FastAPI, Pydantic, Angular, and
+# Node ships security fixes; without Dependabot, the burden of
+# tracking those CVEs falls on whoever has the time to remember. The
+# config below keeps PR volume manageable (`open-pull-requests-limit: 5`)
+# and groups patch / minor updates separately from majors.
+# ---------------------------------------------------------------------------
+
+version: 2
+
+# Global defaults shared by every ecosystem below.
+updates:
+  # -----------------------------------------------------------------------
+  # Backend – Python / pip
+  # -----------------------------------------------------------------------
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    # We keep the manifest files in a single directory; Dependabot will
+    # parse `requirements.txt` and `requirements-dev.txt` automatically
+    # and create a separate PR for each.
+    labels:
+      - "dependencies"
+      - "backend"
+      - "python"
+    # Schedule a weekly check on Mondays at 06:00 Santiago time. That
+    # gives the team a deterministic window to review dependency PRs
+    # before the start of the work day.
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Santiago"
+    # Allow a maximum of 5 open PRs so we never get a backlog of
+    # conflicting bumps stacking up.
+    open-pull-requests-limit: 5
+    # Group patch updates so the noise is bounded – one PR per
+    # release window with the highest version of every bumped package.
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      major:
+        applies-to: version-updates
+        update-types:
+          - "major"
+    # Skip the in-repo version of FastAPI from `versioning-strategy:
+    # increase` so we can review majors in their own PRs.
+    versioning-strategy: increase
+    # Only react to package files; do not open "rebase" or
+    # "recreated" PRs.
+    rebase-strategy: "disabled"
+
+  # -----------------------------------------------------------------------
+  # Frontend – Node / npm
+  # -----------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    labels:
+      - "dependencies"
+      - "frontend"
+      - "javascript"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      angular-major:
+        applies-to: version-updates
+        update-types:
+          - "major"
+    versioning-strategy: increase
+    rebase-strategy: "disabled"
+    # The Angular CLI can rewrite package.json on every version bump
+    # (it adjusts peer ranges); ask Dependabot to commit the lockfile
+    # separately so the diff stays small.
+    commit-message:
+      prefix: "deps(frontend)"
+      prefix-development: "deps-dev(frontend)"
+      include: "scope"
+
+  # -----------------------------------------------------------------------
+  # Docker base images
+  # -----------------------------------------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/backend"
+    labels:
+      - "dependencies"
+      - "backend"
+      - "docker"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 3
+    # We pin to `python:3.12-slim`; Dependabot will only propose
+    # updates to the patch level (3.12.x) by default. A 3.13 bump
+    # would have to be done manually because that crosses the
+    # `target-version` of the project.
+    versioning-strategy: increase
+
+  - package-ecosystem: "docker"
+    directory: "/frontend"
+    labels:
+      - "dependencies"
+      - "frontend"
+      - "docker"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 3
+    versioning-strategy: increase
+
+  # -----------------------------------------------------------------------
+  # GitHub Actions
+  # -----------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    labels:
+      - "dependencies"
+      - "ci"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "09:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 3
+    groups:
+      actions-patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

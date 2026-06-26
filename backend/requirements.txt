@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# Message Gateway – backend runtime dependencies.
+# Pinned with `~=` to allow patch updates while protecting against breaking
+# minor upgrades. CI uses requirements-dev.txt on top of this.
+# ---------------------------------------------------------------------------
+
+# Web framework
+fastapi~=0.115
+uvicorn[standard]~=0.32
+
+# Settings & validation
+pydantic~=2.9
+pydantic-settings~=2.6
+
+# Persistence (used in later tasks; declared now so the image is stable)
+sqlalchemy~=2.0
+asyncpg~=0.30
+alembic~=1.14
+
+# Queue / cache / rate limiting
+redis~=5.2
+arq~=0.26
+
+# HTTP client for provider adapters
+httpx~=0.28

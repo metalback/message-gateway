@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# CODEOWNERS – automatic review requests for the Message Gateway monorepo.
+#
+# GitHub (and the GitHub CLI) consult this file to pick reviewers for
+# every pull request. The rule with the most specific match wins; a
+# later rule does not override an earlier one. We use placeholder team
+# names that match the org structure described in CONTRIBUTING.md §9
+# (`@msg-gateway/backend`, `@msg-gateway/frontend`,
+# `@msg-gateway/platform`, `@msg-gateway/security`) so swapping them
+# out for the real teams is a search-and-replace when the GitHub org
+# is bootstrapped.
+#
+# File location: `.github/CODEOWNERS` is the first path GitHub
+# checks; falling back to `/CODEOWNERS` or `/docs/CODEOWNERS`. We keep
+# it under `.github/` so the whole GitHub-level config sits in one
+# directory.
+# ---------------------------------------------------------------------------
+
+# --- Global default -------------------------------------------------------
+# Everything that does not match a more specific rule below is owned
+# by the platform team. Putting a default in the file (rather than
+# relying on GitHub's "no owner" fallback) guarantees a review
+# request is filed for every PR, even small doc edits.
+*                                               @msg-gateway/platform
+
+# --- Backend (Python / FastAPI) -------------------------------------------
+/backend/                                        @msg-gateway/backend
+/backend/Dockerfile                              @msg-gateway/backend
+/backend/requirements*.txt                       @msg-gateway/backend
+/backend/pyproject.toml                          @msg-gateway/backend
+/backend/alembic.ini                             @msg-gateway/backend
+/backend/alembic/                                @msg-gateway/backend
+/backend/tests/                                  @msg-gateway/backend
+/backend/app/db.py                               @msg-gateway/backend
+/backend/app/config.py                           @msg-gateway/backend
+/backend/app/main.py                             @msg-gateway/backend
+/backend/app/api/                                @msg-gateway/backend
+/backend/app/routes/                             @msg-gateway/backend
+/backend/app/services/                           @msg-gateway/backend
+/backend/app/adapters/                           @msg-gateway/backend
+/backend/app/models/                             @msg-gateway/backend
+/backend/app/observability/                      @msg-gateway/backend
+
+# --- Frontend (Angular / TypeScript) --------------------------------------
+/frontend/                                       @msg-gateway/frontend
+/frontend/Dockerfile                             @msg-gateway/frontend
+/frontend/package.json                           @msg-gateway/frontend
+/frontend/package-lock.json                      @msg-gateway/frontend
+/frontend/angular.json                           @msg-gateway/frontend
+/frontend/karma.conf.js                          @msg-gateway/frontend
+/frontend/nginx.conf                             @frontend
+/frontend/.eslintrc.json                         @msg-gateway/frontend
+/frontend/tailwind.config.js                     @msg-gateway/frontend
+/frontend/src/                                   @msg-gateway/frontend
+
+# --- Shared infra ---------------------------------------------------------
+# The local stack is the contract both apps depend on; both teams
+# should sign off on any change to it.
+/docker-compose.yml                              @msg-gateway/platform @msg-gateway/backend @msg-gateway/frontend
+/.env.example                                    @msg-gateway/platform
+
+# --- CI / CD --------------------------------------------------------------
+# CI is the local + remote gate; the platform team owns it but the
+# backend / frontend leads are pulled in for stack-specific jobs.
+/.github/workflows/ci.yml                        @msg-gateway/platform @msg-gateway/backend @msg-gateway/frontend
+/.github/dependabot.yml                          @msg-gateway/platform
+/.github/CODEOWNERS                              @msg-gateway/platform
+
+# --- Security-sensitive files --------------------------------------------
+# Anything that touches the security policy, secret handling, or
+# PII redaction is owned by the security team. They are the final
+# reviewers on these paths even if the platform team merges the PR.
+SECURITY.md                                      @msg-gateway/security
+/backend/app/observability/redact.py             @msg-gateway/security

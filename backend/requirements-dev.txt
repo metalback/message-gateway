@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Message Gateway – backend development & test dependencies.
+# Installed alongside requirements.txt in CI and local dev.
+# ---------------------------------------------------------------------------
+
+# Testing
+pytest~=8.3
+pytest-asyncio~=0.25
+pytest-cov~=6.0
+httpx~=0.28
+
+# Validates docker-compose / CI YAML fixtures in test_infra.py.
+pyyaml~=6.0
+
+# Linting & formatting
+ruff~=0.7
+mypy~=1.13
+types-PyYAML~=6.0
+
+# Pre-commit hooks (local mirror of the CI pipeline; see
+# .pre-commit-config.yaml and CODING_STANDARDS.md §8). The same
+# version range is used by the `frontend` CI job's
+# `pip install pre-commit` step so local runs and CI agree.
+pre-commit~=3.8

@@ -1,0 +1,12 @@
+# Frontend artefacts
+node_modules/
+dist/
+.angular/
+coverage/
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
