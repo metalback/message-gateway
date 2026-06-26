@@ -22,11 +22,17 @@ ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
 # Rename the base image's "node" user to "agent" and align UID/GID.
-RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+RUN groupmod -g $AGENT_GID node && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+
+# Install OpenCode CLI (runs as root before USER agent)
+RUN npm install -g opencode-ai@latest
+
 USER ${AGENT_UID}:${AGENT_GID}
 
 WORKDIR /home/agent
 
-# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at /home/agent/workspace
-# and overrides the working directory to /home/agent/workspace at container start.
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at ${SANDBOX_REPO_DIR}
+# and overrides the working directory to ${SANDBOX_REPO_DIR} at container start.
+# Force English git output so Sandcastle's worktree fallback logic works
+ENV LC_ALL=C
 ENTRYPOINT ["sleep", "infinity"]
