@@ -1,6 +1,6 @@
 // Parallel Planner — three-phase orchestration loop
 //
-// Adapted for message-gateway using OpenCode provider (opencode-go/deepseek-v4-flash)
+// Adapted for message-gateway using OpenCode provider (opencode-go/minimax-m3)
 //
 // Usage:
 //   npx tsx .sandcastle/main.mts
@@ -42,7 +42,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     name: "planner",
     maxIterations: 1,
     idleTimeoutSeconds: 3600,
-    agent: sandcastle.opencode("opencode-go/deepseek-v4-flash"),
+    agent: sandcastle.opencode("opencode-go/minimax-m3"),
     promptFile: "./.sandcastle/plan-prompt.md",
     output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
   });
@@ -74,7 +74,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         name: "implementer",
         maxIterations: 100,
         idleTimeoutSeconds: 3600,
-        agent: sandcastle.opencode("opencode-go/deepseek-v4-flash"),
+        agent: sandcastle.opencode("opencode-go/minimax-m3"),
         promptFile: "./.sandcastle/implement-prompt.md",
         promptArgs: {
           TASK_ID: issue.id,
@@ -132,7 +132,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     name: "merger",
     maxIterations: 1,
     idleTimeoutSeconds: 3600,
-    agent: sandcastle.opencode("opencode-go/deepseek-v4-flash"),
+    agent: sandcastle.opencode("opencode-go/minimax-m3"),
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
