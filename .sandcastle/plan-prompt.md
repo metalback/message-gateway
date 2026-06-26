@@ -10,7 +10,7 @@ Formato de salida:
 <plan>
 {
   "issues": [
-    { "id": "ID_DEL_ISSUE", "title": "Título descriptivo", "branch": "sandcastle/nombre-branch" }
+    { "id": "2", "title": "Título descriptivo", "branch": "sandcastle/nombre-branch" }
   ]
 }
 </plan>
@@ -18,5 +18,6 @@ Formato de salida:
 IMPORTANTE:
 - Máximo 3 issues por iteración
 - Los branches deben empezar con "sandcastle/"
+- El campo "id" debe ser string (ej: "2", no 2)
 - Responde SOLO con el bloque <plan> JSON, sin texto adicional
 - Usa naming descriptivo en inglés para los branches

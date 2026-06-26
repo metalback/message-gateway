@@ -14,7 +14,7 @@ import { z } from "zod";
 // Plan schema
 const planSchema = z.object({
   issues: z.array(
-    z.object({ id: z.string(), title: z.string(), branch: z.string() }),
+    z.object({ id: z.union([z.string(), z.number()]).transform(String), title: z.string(), branch: z.string() }),
   ),
 });
 
