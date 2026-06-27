@@ -72,6 +72,45 @@ class Settings(BaseSettings):
     # `mgw_test_…` keys without code changes.
     api_key_prefix: str = Field(default="mgw_live_", alias="API_KEY_PREFIX")
 
+    # --- Provider integrations ------------------------------------------
+    # WhatsApp / Meta Cloud API. The platform owns the WABA and
+    # every client sends through the same ``phone_number_id``;
+    # ``access_token`` is the long-lived bearer the Cloud API
+    # expects on every call. ``api_base`` / ``api_version`` are
+    # exposed so a future deployment can pin a different Graph
+    # version (or a sandbox host) without code changes.
+    meta_whatsapp_access_token: str = Field(
+        default="dev-meta-token", alias="META_WHATSAPP_ACCESS_TOKEN"
+    )
+    meta_whatsapp_phone_number_id: str = Field(
+        default="dev-phone-id", alias="META_WHATSAPP_PHONE_NUMBER_ID"
+    )
+    meta_whatsapp_api_base: str = Field(
+        default="https://graph.facebook.com", alias="META_WHATSAPP_API_BASE"
+    )
+    meta_whatsapp_api_version: str = Field(default="v22.0", alias="META_WHATSAPP_API_VERSION")
+
+    # Local Chilean SMS aggregator. ``api_url`` is the operator's
+    # REST endpoint (varies by carrier), ``sender_id`` is the
+    # alphanumeric "from" string the aggregator prints on the
+    # recipient's handset.
+    sms_aggregator_api_url: str = Field(
+        default="https://sms.aggregator.cl", alias="SMS_AGGREGATOR_API_URL"
+    )
+    sms_aggregator_api_key: str = Field(
+        default="dev-sms-aggregator-key", alias="SMS_AGGREGATOR_API_KEY"
+    )
+    sms_aggregator_sender_id: str = Field(default="MSGGTWY", alias="SMS_AGGREGATOR_SENDER_ID")
+
+    # Default timeout (in seconds) applied to every provider HTTP
+    # call. Kept low so a misconfigured upstream fails the request
+    # fast instead of stalling on a TCP handshake. The Meta Cloud
+    # API recommends a ceiling around 10 seconds; the same value
+    # works for the SMS aggregator.
+    provider_timeout_seconds: float = Field(
+        default=10.0, alias="PROVIDER_TIMEOUT_SECONDS", ge=1.0, le=60.0
+    )
+
     # --- Pydantic config ------------------------------------------------
     # `populate_by_name=True` lets tests instantiate `Settings(field="x")`
     # using the pythonic name even though we expose UPPER_SNAKE env vars.

@@ -18,5 +18,14 @@ location to discover the full set of tables in the database.
 
 from app.models.base import Base
 from app.models.client import Client, ClientPlan, ClientStatus
+from app.models.message import Channel, Message, MessageStatus
 
-__all__ = ("Base", "Client", "ClientPlan", "ClientStatus")
+__all__ = (
+    "Base",
+    "Channel",
+    "Client",
+    "ClientPlan",
+    "ClientStatus",
+    "Message",
+    "MessageStatus",
+)
