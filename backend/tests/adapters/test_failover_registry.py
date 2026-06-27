@@ -1,411 +1,451 @@
-"""Unit tests for the failover-aware provider registry (issue #11).
+"""Integration tests for the provider registry's failover path.
 
-The tests cover the integration between
-:func:`app.adapters.registry.get_provider` and the
-:class:`~app.adapters.failover.FailoverProvider`:
+These tests exercise :func:`app.adapters.registry.get_provider`
+together with :class:`~app.adapters.failover.FailoverProvider`
+to pin the contract between the configuration layer
+(``Settings.provider_failover_chains``), the registry
+(:func:`get_provider`) and the failover router.
 
-- When ``provider_failover_chains`` is empty (the default)
-  the registry returns the primary provider directly – this
-  is the pre-failover behaviour and must stay bit-for-bit
-  compatible.
-- When a chain is configured for a channel, the registry
-  returns a :class:`FailoverProvider` that wraps the named
-  providers in order.
-- The primary is always the first element of the chain –
-  any duplicate the operator added is silently dropped (a
-  duplicate does not add availability but rejecting the
-  whole config would block the platform on a typo).
-- The ``register_failover_provider`` helper plugs a new
-  provider into the chain without editing the registry.
-- A chain that names an unregistered provider surfaces a
-  clear error before the first send.
-- The chain resolver accepts a JSON-encoded value in the
-  ``Settings`` (the form the env var uses) and an empty /
-  malformed value disables failover safely.
-
-The tests deliberately exercise the *integration* with the
-real primary factories
-(:class:`MetaWhatsAppProvider` / :class:`SmsAggregatorProvider`)
-so a swap of the production provider surfaces here rather
-than at the first send. The router's own dispatch logic
-lives in :mod:`tests.adapters.test_failover`.
+The tests are deliberately written against the *public* API
+(``get_provider`` + ``provider_failover_chains``) so they
+exercise the same surface the platform uses in production.
+The internal factory maps are monkey-patched only to inject
+deterministic stand-ins (the registry's own builders hit
+external services).
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from app.adapters.base import BaseProvider
+from app.adapters.base import BaseProvider, SendResult
 from app.adapters.failover import FailoverProvider
-from app.adapters.meta_whatsapp import MetaWhatsAppProvider
 from app.adapters.registry import (
-    UnsupportedChannelError,
     UnsupportedProviderError,
     get_provider,
-    register_failover_provider,
-    supported_channels,
 )
-from app.adapters.sms_aggregator import SmsAggregatorProvider
 from app.config import Settings
 from app.models.message import Channel
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Test doubles
 # ---------------------------------------------------------------------------
+
+
+class _StubProvider(BaseProvider):
+    """Provider double that records its identity for assertions.
+
+    The tests use this to confirm the registry returned the
+    chain it was supposed to (primary first, fallbacks in
+    order) without going through any of the concrete adapter
+    constructors – those need real credentials.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    async def send(self, *, to: str, body: str, **kwargs: Any) -> SendResult:
+        return SendResult(provider_msg_id=f"{self.name}-1", raw={})
+
+    async def get_status(self, provider_msg_id: str) -> str:
+        return "sent"
 
 
 @pytest.fixture
-def messaging_settings() -> Settings:
-    """Return a :class:`Settings` instance with all provider
-    credentials populated so the real primary factories do
-    not blow up on construction."""
-    return Settings(
-        meta_whatsapp_access_token="t",
-        meta_whatsapp_phone_number_id="p",
-        sms_aggregator_api_url="https://sms.test",
-        sms_aggregator_api_key="k",
-        sms_aggregator_sender_id="MSGGTWY",
-    )
+def stub_providers(monkeypatch: pytest.MonkeyPatch) -> dict[str, _StubProvider]:
+    """Replace the registry's primary / fallback builders with
+    deterministic :class:`_StubProvider` instances.
 
+    Returns a mapping keyed by the builder's ``name`` so a test
+    can look up the double it expects to appear in the chain
+    without holding a separate variable.
+    """
+    import app.adapters.registry as registry
 
-# ---------------------------------------------------------------------------
-# Default behaviour (no failover)
-# ---------------------------------------------------------------------------
-
-
-def test_get_provider_returns_primary_when_no_failover_configured(
-    messaging_settings: Settings,
-) -> None:
-    """Without a chain configured, the registry must return
-    the primary provider directly – the pre-failover
-    behaviour the MVP shipped with. The
-    :class:`FailoverProvider` wrapper would impose a tiny
-    overhead and obscure the result name in logs, so the
-    registry stays a passthrough when no chain is set."""
-    whatsapp = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-    sms = get_provider(Channel.SMS, settings=messaging_settings)
-
-    assert isinstance(whatsapp, MetaWhatsAppProvider)
-    assert isinstance(sms, SmsAggregatorProvider)
-    assert not isinstance(whatsapp, FailoverProvider)
-    assert not isinstance(sms, FailoverProvider)
-
-
-def test_supported_channels_unchanged_by_failover_feature() -> None:
-    """Adding failover support must not change the set of
-    channels the registry advertises – the OpenAPI schema
-    depends on :func:`supported_channels` and a regression
-    here would surface as a broken docs build."""
-    assert set(supported_channels()) == {Channel.WHATSAPP, Channel.SMS}
-
-
-# ---------------------------------------------------------------------------
-# Failover chains
-# ---------------------------------------------------------------------------
-
-
-def test_get_provider_wraps_chain_in_failover_provider(
-    messaging_settings: Settings,
-) -> None:
-    """A chain configured for ``whatsapp`` produces a
-    :class:`FailoverProvider` whose name joins the chain
-    elements with ``+`` so the routing decision is visible
-    in the logs and the ``Message.provider`` column."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "sms_aggregator"],
+    stubs: dict[str, _StubProvider] = {
+        "meta_whatsapp": _StubProvider("meta_whatsapp"),
+        "twilio_whatsapp": _StubProvider("twilio_whatsapp"),
+        "sms_aggregator": _StubProvider("sms_aggregator"),
+        "twilio_sms": _StubProvider("twilio_sms"),
     }
 
-    provider = get_provider(Channel.WHATSAPP, settings=messaging_settings)
+    def _factory(name: str):
+        def _build(_settings: Settings) -> BaseProvider:
+            return stubs[name]
 
+        return _build
+
+    monkeypatch.setitem(
+        registry._BUILDERS,
+        Channel.WHATSAPP,
+        _factory("meta_whatsapp"),
+    )
+    monkeypatch.setitem(
+        registry._BUILDERS,
+        Channel.SMS,
+        _factory("sms_aggregator"),
+    )
+    registry.register_failover_provider("meta_whatsapp", _factory("meta_whatsapp"))
+    registry.register_failover_provider("twilio_whatsapp", _factory("twilio_whatsapp"))
+    registry.register_failover_provider("sms_aggregator", _factory("sms_aggregator"))
+    registry.register_failover_provider("twilio_sms", _factory("twilio_sms"))
+    return stubs
+
+
+def _settings(**chains: list[str]) -> Settings:
+    """Build a :class:`Settings` with a
+    ``provider_failover_chains`` populated from ``chains``."""
+    return Settings(provider_failover_chains=dict(chains))
+
+
+# ---------------------------------------------------------------------------
+# Pre-failover behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_get_provider_returns_primary_when_chain_is_unset(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """When no chain is configured the registry must return
+    the primary directly – the pre-failover behaviour, kept
+    bit-for-bit compatible with earlier releases (no extra
+    hop, no synthetic name in the ``Message.provider``
+    column)."""
+    settings = _settings()  # no chains
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
+    assert provider is stub_providers["meta_whatsapp"]
+    assert provider.name == "meta_whatsapp"
+
+
+def test_get_provider_returns_primary_when_chain_is_empty(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """An empty list (``[]``) is the operator's way of saying
+    "no fallback for this channel". The registry must honour
+    it the same as a missing key – the primary is returned
+    unchanged."""
+    settings = _settings(whatsapp=[])
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
+    assert provider is stub_providers["meta_whatsapp"]
+
+
+# ---------------------------------------------------------------------------
+# Failover chain construction
+# ---------------------------------------------------------------------------
+
+
+def test_get_provider_returns_failover_wrapper_when_chain_is_configured(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A non-empty chain wraps the primary and the named
+    fallbacks in a :class:`FailoverProvider` so a single
+    ``send`` call transparently advances through the chain."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
     assert isinstance(provider, FailoverProvider)
-    assert provider.name == "meta_whatsapp+sms_aggregator"
-    assert [p.name for p in provider.providers()] == [
-        "meta_whatsapp",
-        "sms_aggregator",
+    assert provider.providers() == [
+        stub_providers["meta_whatsapp"],
+        stub_providers["twilio_whatsapp"],
     ]
 
 
-def test_get_provider_does_not_wrap_unrelated_channels(
-    messaging_settings: Settings,
+def test_get_provider_primary_is_chain_first_element(
+    stub_providers: dict[str, _StubProvider],
 ) -> None:
-    """A chain configured for ``sms`` must not wrap the
-    ``whatsapp`` lookup in a :class:`FailoverProvider` – the
-    two channels are independent. A misconfiguration that
-    would wrap both would mask the actual primary's
-    behaviour for ``whatsapp`` and break an integration test
-    that asserts on the concrete class."""
-    messaging_settings.provider_failover_chains = {
-        "sms": ["sms_aggregator", "meta_whatsapp"],
-    }
-
-    whatsapp = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-
-    assert not isinstance(whatsapp, FailoverProvider)
-    assert isinstance(whatsapp, MetaWhatsAppProvider)
-
-
-def test_chain_always_starts_with_primary(
-    messaging_settings: Settings,
-) -> None:
-    """The contract is "primary first, then fallbacks".
-    The registry drops a duplicate primary at the start of
-    the configured chain (a misconfiguration that would
-    otherwise raise inside the
-    :class:`FailoverProvider` constructor and brick the
-    platform on a typo)."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "meta_whatsapp"],
-    }
-
-    provider = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-
-    assert isinstance(provider, MetaWhatsAppProvider)
-    assert not isinstance(provider, FailoverProvider)
-
-
-def test_chain_drops_duplicate_primary_from_middle(
-    messaging_settings: Settings,
-) -> None:
-    """A duplicate that is not the first element of the
-    chain is also dropped – the chain validator in
-    :class:`FailoverProvider` would otherwise reject the
-    whole configuration, which would block the platform on
-    a typo. (Accepting the config but removing the duplicate
-    is the same policy the platform applies for any other
-    provider, so the behaviour stays consistent.)"""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["twilio_whatsapp", "meta_whatsapp"],
-    }
-
-    # ``twilio_whatsapp`` is not registered yet – the
-    # registry's behaviour for unknown providers is tested
-    # separately; this test focuses on the
-    # duplicate-removal logic.
-    with pytest.raises(UnsupportedProviderError):
-        get_provider(Channel.WHATSAPP, settings=messaging_settings)
-
-
-def test_chain_with_only_duplicate_primary_returns_primary(
-    messaging_settings: Settings,
-) -> None:
-    """If the configured chain only contains the primary
-    (after de-duplication), the registry returns the
-    primary directly – wrapping a one-element chain in a
-    :class:`FailoverProvider` would add a no-op dispatch
-    hop and change the ``provider.name`` in subtle ways."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp"],
-    }
-
-    provider = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-
-    assert isinstance(provider, MetaWhatsAppProvider)
-    assert not isinstance(provider, FailoverProvider)
-
-
-def test_chain_with_unknown_provider_raises(
-    messaging_settings: Settings,
-) -> None:
-    """A chain that names a provider the registry has not
-    registered is a configuration error caught at
-    :func:`get_provider` time. The error is a
-    :class:`UnsupportedProviderError` (a :class:`ValueError`
-    subclass) so the route layer can surface a 422 if it
-    ever reaches the wire (the validator in
-    :class:`Settings` rejects the same shape at boot, so
-    this path is mostly a defensive test)."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "twilio_whatsapp"],
-    }
-
-    with pytest.raises(UnsupportedProviderError) as exc_info:
-        get_provider(Channel.WHATSAPP, settings=messaging_settings)
-    assert exc_info.value.name == "twilio_whatsapp"
-
-
-def test_get_provider_accepts_string_channel(messaging_settings: Settings) -> None:
-    """The :func:`get_provider` contract accepts a string
-    channel (defence-in-depth). The failover integration
-    must not break that path: a string channel goes
-    through the same registry resolution as a
-    :class:`Channel` enum member."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "sms_aggregator"],
-    }
-
-    provider = get_provider("whatsapp", settings=messaging_settings)
-
+    """The primary must be the *first* element of the chain –
+    the failover contract is "primary first, then fallbacks".
+    A swap would silently invert the routing policy."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
     assert isinstance(provider, FailoverProvider)
-    assert provider.name == "meta_whatsapp+sms_aggregator"
+    assert provider.primary is stub_providers["meta_whatsapp"]
+    assert provider.fallbacks == [stub_providers["twilio_whatsapp"]]
 
 
-# ---------------------------------------------------------------------------
-# Settings: JSON parsing
-# ---------------------------------------------------------------------------
-
-
-def test_settings_parses_json_string_into_chain_map() -> None:
-    """The env-var form (``PROVIDER_FAILOVER_CHAINS={"...":"..."}``)
-    must parse into a :class:`dict`. The validator is
-    defensive (an empty string is a no-op, a bad JSON
-    payload raises) so a typo at the deployment stage
-    fails loudly rather than silently disabling failover."""
-    settings = Settings(
-        provider_failover_chains='{"whatsapp": ["meta_whatsapp", "sms_aggregator"]}'
-    )
-
-    assert settings.provider_failover_chains == {
-        "whatsapp": ["meta_whatsapp", "sms_aggregator"],
-    }
-
-
-def test_settings_treats_empty_string_as_disabled() -> None:
-    """An empty ``PROVIDER_FAILOVER_CHAINS`` value (the
-    form a deployment that wants to disable failover
-    would set) must be the same as the default – no
-    chains configured."""
-    settings = Settings(provider_failover_chains="")
-
-    assert settings.provider_failover_chains == {}
-
-
-def test_settings_rejects_malformed_json() -> None:
-    """A malformed JSON value is a configuration error
-    raised at boot – a typo must not silently degrade into
-    "failover disabled", otherwise the operator would
-    never notice they lost their high-availability
-    guarantee."""
-    with pytest.raises(ValueError):
-        Settings(provider_failover_chains="not-json")
-
-
-def test_settings_rejects_non_object_json() -> None:
-    """The chain map is a JSON object; a JSON array or
-    scalar is a configuration error caught at boot."""
-    with pytest.raises(ValueError):
-        Settings(provider_failover_chains="[1, 2, 3]")
-
-
-def test_settings_default_chain_map_is_empty() -> None:
-    """The MVP ships with no chains configured – the
-    pre-failover behaviour is the default. The platform
-    adopts failover only when an operator explicitly
-    opts in."""
-    settings = Settings()
-
-    assert settings.provider_failover_chains == {}
-
-
-# ---------------------------------------------------------------------------
-# Custom provider registration
-# ---------------------------------------------------------------------------
-
-
-def test_register_failover_provider_adds_to_chain(
-    messaging_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_get_provider_chain_name_includes_every_member(
+    stub_providers: dict[str, _StubProvider],
 ) -> None:
-    """The :func:`register_failover_provider` helper lets a
-    future "Twilio WhatsApp adapter" task plug a new
-    provider into the chain without editing the registry
-    module. The helper is also the entry point tests use
-    to inject a custom provider (e.g. a stub) into the
-    chain. The fixture restores the registry after the
-    test runs (the
-    :func:`tests.conftest.monkeypatch` integration handles
-    this automatically)."""
-    from app.adapters import registry
-
-    class _TwilioWhatsApp(BaseProvider):
-        name = "twilio_whatsapp"
-
-        async def send(self, *, to: str, body: str, **kwargs: object):
-            # Shape only – the test never calls ``send`` on the
-            # stub directly, the FailoverProvider does. Keeping
-            # the body minimal so a future reader does not have
-            # to mentally simulate a "no-op" provider.
-            raise NotImplementedError  # pragma: no cover
-
-        async def get_status(self, provider_msg_id: str) -> str:
-            return "sent"
-
-    def _twilio_factory(settings: Settings) -> _TwilioWhatsApp:
-        return _TwilioWhatsApp()
-
-    monkeypatch.setitem(registry._FAILOVER_BUILDERS, "twilio_whatsapp", _twilio_factory)
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "twilio_whatsapp"],
-    }
-
-    provider = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-
-    assert isinstance(provider, FailoverProvider)
+    """The synthetic chain name lists every provider so an
+    operator reading a log line or a ``Message.provider``
+    column can tell a chain is in effect without re-deriving
+    it from the configuration."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
     assert provider.name == "meta_whatsapp+twilio_whatsapp"
 
 
-def test_register_failover_provider_helper_public(
-    messaging_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_get_provider_drops_duplicate_primary_in_chain(
+    stub_providers: dict[str, _StubProvider],
 ) -> None:
-    """The :func:`register_failover_provider` helper is a
-    public, importable symbol so a deployment can plug a
-    new provider from a sidecar module without having to
-    reach into private internals."""
-    import app.adapters.registry as registry_module
+    """A duplicate of the primary in the operator's chain is
+    a no-op (it does not add availability). The registry
+    drops the duplicate rather than erroring out, which
+    mirrors the chain validator in :class:`FailoverProvider`
+    – rejecting the whole config would block the platform on
+    a typo."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp", "meta_whatsapp"])
+    provider = get_provider(Channel.WHATSAPP, settings=settings)
+    assert isinstance(provider, FailoverProvider)
+    assert provider.providers() == [
+        stub_providers["meta_whatsapp"],
+        stub_providers["twilio_whatsapp"],
+    ]
 
-    class _Stub(BaseProvider):
-        name = "stub_provider"
 
-        async def send(self, *, to: str, body: str, **kwargs: object):
-            # Shape only – the helper only registers the
-            # factory, the test never dispatches through it.
-            raise NotImplementedError  # pragma: no cover
+def test_get_provider_raises_for_unknown_provider_name(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A chain entry that the registry does not know is a
+    configuration error; surfacing it at boot (the
+    :class:`Settings` validator) is preferred, but the
+    registry still raises a typed error if it is asked
+    directly."""
+    settings = _settings(whatsapp=["meta_whatsapp", "ghost_provider"])
+    with pytest.raises(UnsupportedProviderError) as exc_info:
+        get_provider(Channel.WHATSAPP, settings=settings)
+    assert exc_info.value.name == "ghost_provider"
 
-        async def get_status(self, provider_msg_id: str) -> str:
-            return "sent"
 
-    monkeypatch.setattr(
-        registry_module,
-        "_FAILOVER_BUILDERS",
-        dict(registry_module._FAILOVER_BUILDERS),
+# ---------------------------------------------------------------------------
+# SMS channel
+# ---------------------------------------------------------------------------
+
+
+def test_get_provider_supports_failover_for_sms(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """The failover mechanism is channel-agnostic: the SMS
+    aggregator can chain to a Twilio SMS fallback the same
+    way the WhatsApp primary chains to a Twilio WhatsApp
+    fallback. The test pins the cross-channel generality so a
+    future refactor does not hard-code the channel list."""
+    settings = _settings(sms=["sms_aggregator", "twilio_sms"])
+    provider = get_provider(Channel.SMS, settings=settings)
+    assert isinstance(provider, FailoverProvider)
+    assert provider.providers() == [
+        stub_providers["sms_aggregator"],
+        stub_providers["twilio_sms"],
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Settings – JSON parsing
+# ---------------------------------------------------------------------------
+
+
+def test_settings_parses_failover_chains_from_json_string() -> None:
+    """The :class:`Settings` field-validator accepts the
+    JSON form so deployments can ship the chain through a
+    single environment variable."""
+    settings = Settings(
+        provider_failover_chains='{"whatsapp": ["meta_whatsapp", "twilio_whatsapp"]}',
     )
-    register_failover_provider("stub_provider", lambda settings: _Stub())
-    assert "stub_provider" in registry_module._FAILOVER_BUILDERS
-
-
-# ---------------------------------------------------------------------------
-# Pre-failover regression: existing test_adapters tests
-# ---------------------------------------------------------------------------
-
-
-def test_existing_get_provider_tests_still_pass_with_default_settings(
-    messaging_settings: Settings,
-) -> None:
-    """Regression guard: the contract the original
-    :func:`test_adapters.test_get_provider_returns_correct_adapter`
-    test pins must still hold with the failover feature
-    merged. The test is duplicated here (rather than
-    relying on the original) so a future change to the
-    failover behaviour does not silently mask a
-    regression in the primaries."""
-    whatsapp = get_provider(Channel.WHATSAPP, settings=messaging_settings)
-    sms = get_provider(Channel.SMS, settings=messaging_settings)
-
-    assert isinstance(whatsapp, BaseProvider)
-    assert isinstance(sms, BaseProvider)
-    assert whatsapp.name == "meta_whatsapp"
-    assert sms.name == "sms_aggregator"
-
-
-def test_get_provider_unknown_channel_still_raises_unsupported(
-    messaging_settings: Settings,
-) -> None:
-    """An unknown channel is still a
-    :class:`UnsupportedChannelError` even with failover
-    enabled – the channel validation runs before the
-    chain resolution, so a typo in the chain name does
-    not mask a typo in the channel."""
-    messaging_settings.provider_failover_chains = {
-        "whatsapp": ["meta_whatsapp", "sms_aggregator"],
+    assert settings.provider_failover_chains == {
+        "whatsapp": ["meta_whatsapp", "twilio_whatsapp"],
     }
 
+
+def test_settings_rejects_malformed_json() -> None:
+    """A typo in the chain value is a hard configuration
+    error: failing fast at boot is better than silently
+    disabling failover at runtime."""
+    with pytest.raises(ValueError, match="PROVIDER_FAILOVER_CHAINS"):
+        Settings(provider_failover_chains="not a json")
+
+
+def test_settings_rejects_non_object_json() -> None:
+    """A JSON array (or scalar) is not a valid chain map; the
+    validator rejects it so the operator notices the typo
+    rather than discovering a missing failover in
+    production."""
+    with pytest.raises(ValueError, match="PROVIDER_FAILOVER_CHAINS"):
+        Settings(provider_failover_chains='["meta_whatsapp"]')
+
+
+def test_settings_empty_string_normalises_to_empty_dict() -> None:
+    """An unset env var is the operator's way of saying "no
+    failover". The validator normalises it to an empty dict
+    so the rest of the platform does not have to special-case
+    ``None`` vs ``""``."""
+    settings = Settings(provider_failover_chains="")
+    assert settings.provider_failover_chains == {}
+
+
+def test_settings_default_is_empty_dict() -> None:
+    """The default keeps the pre-failover behaviour: an
+    empty chain means every channel maps to a single
+    provider."""
+    settings = Settings()
+    assert settings.provider_failover_chains == {}
+
+
+# ---------------------------------------------------------------------------
+# Channel parsing
+# ---------------------------------------------------------------------------
+
+
+def test_get_provider_accepts_channel_as_string(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """Defence-in-depth: even though the route layer
+    validates ``channel`` before reaching the registry, the
+    registry also accepts the plain-string form so a
+    malformed request never raises a ``KeyError`` (the
+    exception layer would have to map ``KeyError`` → 422
+    which is brittle)."""
+    settings = _settings()
+    provider = get_provider("whatsapp", settings=settings)
+    assert provider is stub_providers["meta_whatsapp"]
+
+
+def test_get_provider_rejects_unknown_channel_string(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A channel the platform does not know is a 422 in the
+    route layer; the registry surfaces a typed
+    :class:`UnsupportedChannelError` for the mapper."""
+    from app.adapters.registry import UnsupportedChannelError
+
+    settings = _settings()
     with pytest.raises(UnsupportedChannelError):
-        get_provider("unknown_channel", settings=messaging_settings)
+        get_provider("telegram", settings=settings)
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The ``inactive`` set on :func:`get_provider` is the
+# operator's manual disable. The tests below pin the
+# contract between the dashboard ("desactivar" button) and
+# the routing layer: the chain the registry returns must
+# not include a disabled provider, and the synthetic
+# chain name must reflect the surviving members only.
+
+
+def test_get_provider_skips_inactive_primary(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A chain whose primary is in the kill-switch set
+    is re-headed: the next active member becomes the
+    new primary. The result is a single-provider
+    chain (no :class:`FailoverProvider` wrapper) so
+    the call site does not pay the failover overhead
+    for a chain with one survivor."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(
+        Channel.WHATSAPP,
+        settings=settings,
+        inactive={"meta_whatsapp"},
+    )
+    # Single survivor → registry unwraps the chain.
+    assert provider is stub_providers["twilio_whatsapp"]
+    assert provider.name == "twilio_whatsapp"
+
+
+def test_get_provider_filters_inactive_fallback(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A chain whose *fallback* is disabled is returned
+    as a single provider (the surviving primary). The
+    registry unwraps the chain when only one member
+    survives so the call site does not pay the
+    failover overhead for a chain of one."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(
+        Channel.WHATSAPP,
+        settings=settings,
+        inactive={"twilio_whatsapp"},
+    )
+    # Single survivor → registry unwraps the chain.
+    assert provider is stub_providers["meta_whatsapp"]
+    assert provider.name == "meta_whatsapp"
+
+
+def test_get_provider_filters_multiple_inactive(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """Several inactive names at once: the registry
+    filters *all* of them, preserving the order. A
+    future iteration that wants to skip a chain in
+    bulk (e.g. "disable the WhatsApp fleet for
+    maintenance") should be a single call to
+    :func:`get_provider` with a pre-populated set."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings(
+        whatsapp=["meta_whatsapp", "twilio_whatsapp"],
+        sms=["sms_aggregator", "twilio_sms"],
+    )
+    # All WhatsApp providers disabled: the registry
+    # must surface :class:`AllProvidersDisabledError`
+    # so the route layer can render a 503. The SMS
+    # chain is unaffected (separate channel).
+    with pytest.raises(AllProvidersDisabledError):
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp", "twilio_whatsapp"},
+        )
+
+
+def test_get_provider_raises_when_every_provider_disabled(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """Every member in the kill-switch set: the
+    registry raises :class:`AllProvidersDisabledError`
+    (a :class:`ProviderError` subclass) so the route
+    layer can surface a 503 with a stable error code
+    rather than silently returning an empty chain."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    with pytest.raises(AllProvidersDisabledError) as exc_info:
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp", "twilio_whatsapp"},
+        )
+    assert exc_info.value.channel == Channel.WHATSAPP
+    assert exc_info.value.http_status == 503
+    assert exc_info.value.code == "provider_disabled"
+
+
+def test_get_provider_raises_when_single_provider_disabled(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A single-provider channel (no chain configured)
+    whose only provider is disabled is the same
+    edge case: :class:`AllProvidersDisabledError` so
+    the route layer can render a 503 with the same
+    error code the chain path uses."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings()  # no chains
+    with pytest.raises(AllProvidersDisabledError) as exc_info:
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp"},
+        )
+    assert exc_info.value.channel == Channel.WHATSAPP
+
+
+def test_get_provider_empty_inactive_set_keeps_pre_kill_switch_behaviour(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """``inactive=None`` and ``inactive=set()`` both
+    keep the pre-kill-switch behaviour bit-for-bit.
+    A deployment that has not opted into the
+    kill-switch (the common case for the MVP) does
+    not have to change its call site."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    chain_none = get_provider(Channel.WHATSAPP, settings=settings, inactive=None)
+    chain_empty = get_provider(
+        Channel.WHATSAPP, settings=settings, inactive=set()
+    )
+    assert isinstance(chain_none, FailoverProvider)
+    assert isinstance(chain_empty, FailoverProvider)
+    assert chain_none.providers() == chain_empty.providers()

@@ -100,15 +100,18 @@ from sqlalchemy.sql import ColumnElement
 
 from app.adapters.base import SendResult
 from app.adapters.errors import ProviderError
-from app.adapters.registry import get_provider
+from app.adapters.failover import FailoverProvider
+from app.adapters.registry import AllProvidersDisabledError, get_provider
 from app.config import Settings, get_settings
 from app.models.batch import Batch, BatchStatus
 from app.models.client import Client, ClientPlan
 from app.models.message import Channel, Message, MessageStatus
+from app.models.routing_log import RoutingLogOutcome
 from app.observability import get_logger, normalise_phone
 
 if TYPE_CHECKING:
     from app.adapters.base import BaseProvider
+    from app.adapters.failover import AttemptCallback, FailoverProvider
     from app.services.webhook_delivery import WebhookDeliveryResult
 
     class _WebhookDeliveryLike(Protocol):
@@ -915,6 +918,8 @@ def _provider_name_for(channel: Channel, *, settings: Settings) -> str:
 async def _dispatch(
     provider: BaseProvider,
     message: Message,
+    *,
+    attempt_callback: AttemptCallback | None = None,
 ) -> tuple[SendResult, float]:
     """Call ``provider.send`` and time the round-trip.
 
@@ -936,10 +941,30 @@ async def _dispatch(
     breakdown uses the column as a quality-of-service
     metric, and an average that mixes successful and failed
     calls would conflate two different signals.
+
+    ``attempt_callback`` (issue #11) is forwarded to the
+    provider *only* when ``provider`` is a
+    :class:`~app.adapters.failover.FailoverProvider` – the
+    callback is a router concern, not an adapter concern.
+    Forwarding it to a concrete adapter would also pollute
+    the per-call kwargs the existing test doubles capture
+    verbatim, breaking the pre-failover test surface.
     """
     started = time.perf_counter()
     try:
-        result = await provider.send(to=message.to_number, body=message.body)
+        if attempt_callback is not None and isinstance(
+            provider, FailoverProvider
+        ):
+            result = await provider.send(
+                to=message.to_number,
+                body=message.body,
+                attempt_callback=attempt_callback,
+            )
+        else:
+            result = await provider.send(
+                to=message.to_number,
+                body=message.body,
+            )
     except ProviderError:
         # The provider layer already classifies the failure
         # (unavailable / validation / rate limit). We re-raise
@@ -1021,9 +1046,53 @@ async def send_message(
     await session.commit()
     await session.refresh(message)
 
-    provider = get_provider(channel, settings=cfg)
+    # Issue #11 (kill-switch): the operator can disable a
+    # provider from the admin dashboard. The
+    # :func:`app.services.provider_health.get_inactive_provider_names`
+    # helper returns the live set; we feed it to
+    # :func:`get_provider` so the chain the messaging
+    # service walks contains only enabled upstreams. The
+    # lookup is a single indexed read on a handful of
+    # rows – the cost is dwarfed by the HTTP call that
+    # follows.
+    from app.services.provider_health import get_inactive_provider_names
+
+    inactive = await get_inactive_provider_names(session)
     try:
-        result, latency_ms = await _dispatch(provider, message)
+        provider = get_provider(channel, settings=cfg, inactive=inactive)
+    except AllProvidersDisabledError as exc:
+        # The kill-switch is on for every provider in the
+        # chain – the message has nowhere to go. Mark it
+        # ``failed`` so the customer sees a definitive
+        # outcome (rather than a row that stays in
+        # ``pending`` forever) and re-raise so the route
+        # layer can surface the 503.
+        message.status = MessageStatus.FAILED
+        message.error_code = exc.code
+        message.error_message = exc.message[:500]
+        await session.commit()
+        await session.refresh(message)
+        raise
+    # Issue #11: wire the per-attempt recorder into the
+    # failover router so every provider attempt the
+    # chain walks lands as a row in ``routing_log``.
+    # The recorder stages rows on the same session the
+    # service uses; the final ``commit`` flushes them
+    # atomically with the parent ``Message`` row.
+    from app.services.provider_health import build_attempt_recorder
+
+    recorder = build_attempt_recorder(
+        session,
+        channel=channel,
+        message_id=message.id,
+    )
+    is_chain = isinstance(provider, FailoverProvider)
+    try:
+        result, latency_ms = await _dispatch(
+            provider,
+            message,
+            attempt_callback=recorder if is_chain else None,
+        )
     except ProviderError as exc:
         message.status = MessageStatus.FAILED
         message.error_code = exc.code
@@ -1031,13 +1100,26 @@ async def send_message(
         # If the failover wrapper re-raised a non-retryable
         # error from one of its underlyings, the synthetic
         # chain name in ``message.provider`` is misleading –
-        # the operator wants to know *which* upstream
-        # surfaced the rejection. ``exc.provider`` carries the
-        # underlying adapter's name (set by the concrete
-        # adapter) so we can keep the column accurate even
-        # on a failed dispatch.
+        # the operator wants to know *which* upstream surfaced
+        # the rejection. ``exc.provider`` carries the underlying
+        # adapter's name (set by the concrete adapter) so we
+        # can keep the column accurate even on a failed
+        # dispatch.
         if exc.provider and exc.provider != message.provider:
             message.provider = exc.provider
+        # Single-provider path: the failover router did
+        # not get a chance to emit a per-attempt event
+        # (no chain to walk), so the service records the
+        # attempt itself. The chain path already has the
+        # rows staged by the router.
+        if not is_chain:
+            recorder(
+                provider.name,
+                _outcome_from_exception(exc),
+                0,
+                exc.code,
+                exc.message,
+            )
         await session.commit()
         await session.refresh(message)
         return SendOutcome(message=message, provider_msg_id=None)
@@ -1055,15 +1137,43 @@ async def send_message(
     # fail.
     message.latency_ms = latency_ms
     # The failover router may have switched providers mid-call;
-    # ``result.provider_name`` carries the *actual* upstream that
-    # accepted the message so an operator looking at the
+    # ``result.provider_name`` carries the *actual* upstream
+    # that accepted the message so an operator looking at the
     # ``Message.provider`` column can tell a failover happened.
     actual_provider = result.provider_name or provider.name
     if actual_provider != message.provider:
         message.provider = actual_provider
+    # Single-provider path: the failover router did
+    # not get a chance to emit a per-attempt event
+    # (no chain to walk), so the service records the
+    # successful attempt itself. The chain path
+    # already has the rows staged by the router.
+    if not is_chain:
+        recorder(
+            provider.name,
+            RoutingLogOutcome.SUCCESS,
+            0,
+            None,
+            None,
+        )
     await session.commit()
     await session.refresh(message)
     return SendOutcome(message=message, provider_msg_id=result.provider_msg_id)
+
+
+def _outcome_from_exception(exc: ProviderError | None) -> RoutingLogOutcome:
+    """Map a :class:`ProviderError` to the matching :class:`RoutingLogOutcome` bucket.
+
+    Kept module-private so the messaging service can
+    log a single-provider failure with the same
+    outcome the failover router would have used. The
+    function delegates to the canonical helper in
+    :mod:`app.services.provider_health` so the two
+    paths agree on the (exc-class → outcome) mapping.
+    """
+    from app.services.provider_health import _outcome_from_exception
+
+    return _outcome_from_exception(exc)
 
 
 async def send_batch(

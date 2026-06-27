@@ -35,7 +35,11 @@ from app.adapters.errors import (
     ProviderUnavailableError,
     ProviderValidationError,
 )
-from app.adapters.failover import RETRYABLE_ERRORS, FailoverProvider
+from app.adapters.failover import (
+    RETRYABLE_ERRORS,
+    AttemptCallback,
+    FailoverProvider,
+)
 from app.adapters.flow import (
     FlowClient,
     FlowError,
@@ -53,6 +57,7 @@ from app.adapters.registry import (
 )
 
 __all__ = (
+    "AttemptCallback",
     "BaseProvider",
     "FailoverProvider",
     "FlowClient",

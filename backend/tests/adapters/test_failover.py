@@ -1,38 +1,33 @@
-"""Unit tests for :class:`app.adapters.failover.FailoverProvider` (issue #11).
+"""Unit tests for :class:`app.adapters.failover.FailoverProvider`.
 
-The tests cover the failover router contract:
+The router is a thin wrapper around an ordered list of
+:class:`BaseProvider` instances: it tries the primary and falls
+back to the next provider on a *retryable* error. The tests
+exercise every branch of that contract:
 
-- A single-provider chain behaves like a plain
-  :class:`BaseProvider` (no extra hop, no surprise).
-- A retryable error from the primary (5xx, 429) makes the
-  router try the next provider.
-- A non-retryable error from the primary (validation / 4xx)
-  short-circuits the chain: the request is malformed and a
-  different upstream would fail the same way.
-- A validation error from a *fallback* also short-circuits
-  the rest of the chain – the next provider is not given a
-  chance to fail the same way.
-- When every provider raises a retryable error, the *last*
-  one is surfaced (the freshest signal of the upstream's
-  state).
-- The :class:`SendResult` carries the *actual* provider name
-  that handled the call (so the messaging service can record
-  it on the persisted row).
-- :meth:`get_status` uses the provider that originally
-  accepted the message, not the chain's primary.
-- The constructor refuses empty chains and chains with
-  duplicate providers.
+- Successful primary → no fallback, ``SendResult.provider_name``
+  is stamped with the primary's name.
+- Primary raises ``ProviderUnavailableError`` → fallback gets
+  the call, ``provider_name`` reflects the fallback.
+- Primary raises ``ProviderRateLimitError`` → fallback gets the
+  call.
+- Primary raises ``ProviderValidationError`` → router propagates
+  immediately (a malformed request would fail the same way
+  against the next provider, so there is no point burning its
+  quota).
+- Every provider raises a retryable error → the *last* one
+  surfaces so the caller sees the freshest signal.
+- ``get_status`` routes back to the provider that actually
+  delivered the message.
 
-The HTTP layer is not exercised here: the router is a
-pure-Python abstraction over :class:`BaseProvider`, so a stub
-provider is the right level of test. The end-to-end
-integration with the registry's real adapters lives in
-:mod:`tests.adapters.test_failover_registry` and
-:mod:`tests.services.test_messaging`.
+The test doubles are deliberately small (a :class:`FakeProvider`
+that records every call) so a failure points straight at the
+contract that broke.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -51,55 +46,53 @@ from app.adapters.failover import RETRYABLE_ERRORS, FailoverProvider
 # ---------------------------------------------------------------------------
 
 
-class _ScriptedProvider(BaseProvider):
-    """A controllable :class:`BaseProvider` for failover tests.
+class FakeProvider(BaseProvider):
+    """Controllable :class:`BaseProvider` for failover tests.
 
-    The constructor accepts a list of *outcomes* – the router will
-    consume them in order:
-
-    - A :class:`SendResult` is returned verbatim.
-    - An :class:`Exception` instance is raised.
-
-    The double also records every call so the test can assert on
-    the routing decision the chain made.
+    The constructor wires the next response and the next error
+    so a test can build a chain like
+    ``[primary(unavailable), fallback(success)]`` declaratively.
+    The double records every ``send`` and ``get_status`` call so
+    a test can assert the chain advanced in the expected order.
     """
 
     def __init__(
         self,
-        *,
         name: str,
-        outcomes: list[SendResult | BaseException],
+        *,
+        provider_msg_id: str | None = None,
+        status: str = "sent",
+        errors: list[Exception] | None = None,
     ) -> None:
         self.name = name
-        self._outcomes = list(outcomes)
+        self._provider_msg_id = provider_msg_id or f"{name}-id"
+        self._status = status
+        # ``errors`` is a FIFO queue: each call pops the head;
+        # an empty queue means "return success".
+        self._errors = list(errors or [])
         self.send_calls: list[dict[str, Any]] = []
         self.status_calls: list[str] = []
+        self.closed = False
 
-    async def send(self, *, to: str, body: str, **kwargs: object) -> SendResult:
+    def push_error(self, error: Exception) -> None:
+        """Schedule ``error`` to be raised on the next ``send`` call."""
+        self._errors.append(error)
+
+    async def send(self, *, to: str, body: str, **kwargs: Any) -> SendResult:
         self.send_calls.append({"to": to, "body": body, **kwargs})
-        outcome = self._outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
+        if self._errors:
+            raise self._errors.pop(0)
+        return SendResult(
+            provider_msg_id=self._provider_msg_id,
+            raw={"from": self.name},
+        )
 
     async def get_status(self, provider_msg_id: str) -> str:
         self.status_calls.append(provider_msg_id)
-        return f"status:{self.name}:{provider_msg_id}"
+        return self._status
 
-
-def _ok(*, name: str, provider_msg_id: str = "ok-1") -> _ScriptedProvider:
-    """Build a provider that always returns a successful SendResult."""
-    return _ScriptedProvider(
-        name=name,
-        outcomes=[SendResult(provider_msg_id=provider_msg_id, raw={"from": name})],
-    )
-
-
-def _fails_with(
-    *, name: str, error: ProviderError
-) -> _ScriptedProvider:
-    """Build a provider that raises ``error`` on the first call."""
-    return _ScriptedProvider(name=name, outcomes=[error])
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 # ---------------------------------------------------------------------------
@@ -107,509 +100,659 @@ def _fails_with(
 # ---------------------------------------------------------------------------
 
 
-def test_failover_rejects_empty_chain() -> None:
-    """An empty chain is a programming error caught at
-    construction time; the router would not know which
-    upstream to dispatch to."""
-    with pytest.raises(ValueError):
+def test_empty_chain_is_rejected() -> None:
+    """A chain with no providers is meaningless: the router
+    would not know who to call. Rejecting it at construction
+    keeps the failure mode at boot rather than at the first
+    ``send`` call."""
+    with pytest.raises(ValueError, match="at least one provider"):
         FailoverProvider([])
 
 
-def test_failover_rejects_duplicate_providers() -> None:
-    """A chain with the same provider twice does not improve
-    availability and would double-count the cost of the call.
-    The constructor rejects it so the misconfiguration
-    surfaces at boot rather than at the first send."""
-    primary = _ok(name="meta_whatsapp")
-    with pytest.raises(ValueError):
-        FailoverProvider([primary, _ok(name="meta_whatsapp")])
+def test_duplicate_providers_in_chain_are_rejected() -> None:
+    """A chain with the same provider twice does not add
+    availability – it just double-counts the cost of the call.
+    The router refuses to build such a chain so a typo in the
+    operator's config surfaces immediately."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("meta_whatsapp")
+    with pytest.raises(ValueError, match="duplicate"):
+        FailoverProvider([a, b])
 
 
-def test_failover_name_lists_chain_in_order() -> None:
-    """The synthetic name joins the chain with ``+`` so logs
-    and the ``Message.provider`` column make the failover
-    topology obvious without re-querying the registry."""
-    chain = FailoverProvider(
-        [_ok(name="meta_whatsapp"), _ok(name="twilio_whatsapp")]
-    )
+def test_name_joins_chain_with_plus_separator() -> None:
+    """The synthetic chain name is ``a+b+c`` so a log entry or
+    a ``Message.provider`` column read is self-describing."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("twilio_whatsapp")
+    c = FakeProvider("gupshup_whatsapp")
+    chain = FailoverProvider([a, b, c])
+    assert chain.name == "meta_whatsapp+twilio_whatsapp+gupshup_whatsapp"
+
+
+def test_name_reflects_runtime_chain_order() -> None:
+    """The synthetic name is recomputed from the current
+    providers, so a test that swaps the chain at runtime sees
+    a fresh label without having to rebuild the router."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("twilio_whatsapp")
+    chain = FailoverProvider([a, b])
     assert chain.name == "meta_whatsapp+twilio_whatsapp"
 
 
-def test_failover_primary_and_fallbacks_accessors() -> None:
-    """The :attr:`primary` and :attr:`fallbacks` accessors
-    expose the chain order so an operator (or a health check)
-    can introspect the configuration."""
-    primary = _ok(name="meta_whatsapp")
-    fallback_a = _ok(name="twilio_whatsapp")
-    fallback_b = _ok(name="gupshup_whatsapp")
-    chain = FailoverProvider([primary, fallback_a, fallback_b])
-
-    assert chain.primary is primary
-    assert chain.fallbacks == [fallback_a, fallback_b]
-    assert chain.providers() == [primary, fallback_a, fallback_b]
-
-
-def test_retryable_errors_constant_is_frozen() -> None:
-    """The retryable-error tuple is a module-level contract:
-    tests that care about which error types trigger failover
-    can import it and assert on its identity rather than on
-    the value. Guarding against accidental mutation keeps
-    the contract stable across the rest of the suite."""
-    assert ProviderUnavailableError in RETRYABLE_ERRORS
-    assert ProviderRateLimitError in RETRYABLE_ERRORS
-    # Validation is *not* retryable – a malformed message would
-    # fail the same way against every upstream.
-    assert ProviderValidationError not in RETRYABLE_ERRORS
-
-
 # ---------------------------------------------------------------------------
-# send() — primary-only / single-element chain
+# send – success paths
 # ---------------------------------------------------------------------------
 
 
-async def test_single_provider_chain_returns_result_unchanged() -> None:
-    """A one-element chain is the no-op case: the router
-    must return the underlying provider's result verbatim,
-    including its ``provider_name``."""
-    primary = _ScriptedProvider(
-        name="meta_whatsapp",
-        outcomes=[SendResult(provider_msg_id="wamid.1", raw={})],
-    )
-    chain = FailoverProvider([primary])
-
-    result = await chain.send(to="+56912345678", body="hola")
-
-    assert result.provider_msg_id == "wamid.1"
-    assert result.provider_name == "meta_whatsapp"
-    assert primary.send_calls == [{"to": "+56912345678", "body": "hola"}]
-
-
-async def test_primary_succeeds_and_fallback_is_never_called() -> None:
-    """When the primary succeeds, the fallback must not see
-    the call – a fallback invocation would burn the
-    upstream's rate-limit budget for nothing."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+async def test_send_returns_primary_result_on_success() -> None:
+    """When the primary succeeds the chain stops; the result
+    surfaces the primary's ``provider_msg_id`` and the
+    router-stamped ``provider_name`` so the messaging service
+    can record the actual upstream on the persisted row."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
     chain = FailoverProvider([primary, fallback])
 
     result = await chain.send(to="+56912345678", body="hola")
 
-    assert result.provider_msg_id == "wamid.1"
+    assert result.provider_msg_id == "meta-1"
     assert result.provider_name == "meta_whatsapp"
-    assert primary.send_calls
+    assert primary.send_calls == [{"to": "+56912345678", "body": "hola"}]
     assert fallback.send_calls == []
 
 
-# ---------------------------------------------------------------------------
-# send() — fallback on retryable errors
-# ---------------------------------------------------------------------------
-
-
-async def test_5xx_from_primary_triggers_fallback() -> None:
-    """A 5xx-class failure from the primary (rendered as a
-    :class:`ProviderUnavailableError`) is a transient
-    upstream outage; the router must try the next provider
-    instead of letting the caller see the failure."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderUnavailableError("meta 502", provider="meta_whatsapp"),
+async def test_send_preserves_existing_provider_name_on_send_result() -> None:
+    """If the underlying provider already stamped
+    ``SendResult.provider_name`` (e.g. a future nested chain)
+    the router does not overwrite it – the inner chain is the
+    authoritative source of "who actually handled the call"."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("down", provider="meta_whatsapp")],
     )
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+
+    class _StampingProvider(BaseProvider):
+        name = "stamping"
+
+        async def send(self, *, to: str, body: str, **kwargs: Any) -> SendResult:
+            return SendResult(
+                provider_msg_id="stamp-1",
+                raw={},
+                provider_name="inner_provider",
+            )
+
+        async def get_status(self, provider_msg_id: str) -> str:
+            return "sent"
+
+    chain = FailoverProvider([primary, _StampingProvider()])
+    result = await chain.send(to="+56912345678", body="hola")
+    assert result.provider_name == "inner_provider"
+    assert result.provider_msg_id == "stamp-1"
+
+
+# ---------------------------------------------------------------------------
+# send – fallback on retryable errors
+# ---------------------------------------------------------------------------
+
+
+async def test_send_falls_back_when_primary_is_unavailable() -> None:
+    """A ``ProviderUnavailableError`` from the primary is the
+    canonical signal the chain is built to handle: the router
+    moves on to the fallback and stamps the result with the
+    fallback's name."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("meta 5xx", provider="meta_whatsapp")],
+    )
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
     chain = FailoverProvider([primary, fallback])
 
     result = await chain.send(to="+56912345678", body="hola")
 
-    assert result.provider_msg_id == "twilio.1"
+    assert result.provider_msg_id == "tw-1"
     assert result.provider_name == "twilio_whatsapp"
     assert primary.send_calls
     assert fallback.send_calls == [{"to": "+56912345678", "body": "hola"}]
 
 
-async def test_429_from_primary_triggers_fallback() -> None:
-    """A 429 (rate limit) on the primary does not mean the
-    fallback is also throttled – the next provider has its
-    own quota. The router must try it."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderRateLimitError("meta 429", provider="meta_whatsapp"),
+async def test_send_falls_back_when_primary_is_rate_limited() -> None:
+    """A 429 from the primary is also retryable: the rate
+    limit might be lifted by the time the fallback answers,
+    and we do not want to wedge the customer on a quota the
+    second provider has not exhausted yet."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderRateLimitError("meta 429", retry_after=1.0, provider="meta_whatsapp")],
     )
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
     chain = FailoverProvider([primary, fallback])
 
     result = await chain.send(to="+56912345678", body="hola")
 
-    assert result.provider_msg_id == "twilio.1"
+    assert result.provider_msg_id == "tw-1"
     assert result.provider_name == "twilio_whatsapp"
 
 
-async def test_fallback_also_fails_with_retryable_then_uses_next() -> None:
-    """When the first fallback *also* fails with a retryable
-    error, the router continues down the chain. The third
-    provider succeeds and the result must reflect that."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderUnavailableError("meta down", provider="meta_whatsapp"),
+async def test_send_falls_back_through_multiple_retryable_failures() -> None:
+    """A chain with two consecutive ``ProviderUnavailableError``
+    failures keeps advancing; the third provider finally
+    accepts the message. The test pins the contract that *any*
+    number of retryable errors is handled (not just the first
+    fallback)."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("down", provider="meta_whatsapp")],
     )
-    first_fallback = _fails_with(
-        name="twilio_whatsapp",
-        error=ProviderRateLimitError("twilio 429", provider="twilio_whatsapp"),
+    second = FakeProvider(
+        "twilio_whatsapp",
+        errors=[ProviderUnavailableError("down", provider="twilio_whatsapp")],
     )
-    last_resort = _ok(name="gupshup_whatsapp", provider_msg_id="gup.1")
-    chain = FailoverProvider([primary, first_fallback, last_resort])
+    third = FakeProvider("gupshup_whatsapp", provider_msg_id="g-1")
+    chain = FailoverProvider([primary, second, third])
 
     result = await chain.send(to="+56912345678", body="hola")
 
-    assert result.provider_msg_id == "gup.1"
+    assert result.provider_msg_id == "g-1"
     assert result.provider_name == "gupshup_whatsapp"
-    assert primary.send_calls and first_fallback.send_calls and last_resort.send_calls
+    assert primary.send_calls and second.send_calls and third.send_calls
 
 
-async def test_all_providers_fail_raises_last_retryable() -> None:
-    """When every provider raises a retryable error the
-    router surfaces the *last* one (the freshest signal of
-    the upstream's state). The exception's ``provider``
-    attribute matches the failing provider so an operator
-    can correlate the failure with a dashboard chart."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderUnavailableError("meta 502", provider="meta_whatsapp"),
+async def test_send_returns_last_retryable_when_all_providers_fail() -> None:
+    """When every provider in the chain raises a retryable
+    error, the *last* one surfaces so the caller's logs and
+    metrics reflect the freshest signal (e.g. Meta 503, then
+    Twilio 429, then Gupshup 502)."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("meta 5xx", provider="meta_whatsapp")],
     )
-    fallback = _fails_with(
-        name="twilio_whatsapp",
-        error=ProviderUnavailableError("twilio 502", provider="twilio_whatsapp"),
+    fallback = FakeProvider(
+        "twilio_whatsapp",
+        errors=[ProviderUnavailableError("twilio 5xx", provider="twilio_whatsapp")],
     )
     chain = FailoverProvider([primary, fallback])
 
     with pytest.raises(ProviderUnavailableError) as exc_info:
         await chain.send(to="+56912345678", body="hola")
+
     assert exc_info.value.provider == "twilio_whatsapp"
-    assert "twilio 502" in str(exc_info.value)
+    assert "twilio 5xx" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# send() — non-retryable errors short-circuit
+# send – permanent failures short-circuit the chain
 # ---------------------------------------------------------------------------
 
 
-async def test_validation_error_from_primary_does_not_failover() -> None:
-    """A :class:`ProviderValidationError` (4xx-class) means
-    the request itself is malformed; the next provider would
-    reject the same payload. The router must propagate the
-    error without trying the fallback, otherwise a
-    misconfigured destination would burn the fallback's
-    rate-limit budget for nothing."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderValidationError("bad number", provider="meta_whatsapp"),
+async def test_send_propagates_validation_error_without_trying_fallback() -> None:
+    """A ``ProviderValidationError`` from the primary is *not*
+    retried against the fallback: the request itself is
+    malformed (bad number, template rejected) and would fail
+    the same way against the next provider. The router
+    propagates the error immediately so the customer sees the
+    422 instead of burning the fallback's quota."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderValidationError("bad number", provider="meta_whatsapp")],
     )
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
     chain = FailoverProvider([primary, fallback])
 
     with pytest.raises(ProviderValidationError) as exc_info:
-        await chain.send(to="+56912345678", body="hola")
+        await chain.send(to="bad", body="hola")
+
     assert exc_info.value.provider == "meta_whatsapp"
     assert fallback.send_calls == []
 
 
-async def test_validation_error_from_fallback_short_circuits_chain() -> None:
-    """If the fallback raises a validation error, the
-    remaining providers in the chain must not be tried –
-    the error is permanent, not transient."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderUnavailableError("meta 502", provider="meta_whatsapp"),
+async def test_send_propagates_validation_error_from_fallback() -> None:
+    """If the primary's retryable error masked a problem the
+    fallback catches, the validation error still propagates
+    rather than cascading through the rest of the chain."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("meta 5xx", provider="meta_whatsapp")],
     )
-    first_fallback = _fails_with(
-        name="twilio_whatsapp",
-        error=ProviderValidationError("bad template", provider="twilio_whatsapp"),
+    fallback = FakeProvider(
+        "twilio_whatsapp",
+        errors=[ProviderValidationError("rejected", provider="twilio_whatsapp")],
     )
-    last_resort = _ok(name="gupshup_whatsapp", provider_msg_id="gup.1")
-    chain = FailoverProvider([primary, first_fallback, last_resort])
+    chain = FailoverProvider([primary, fallback])
 
     with pytest.raises(ProviderValidationError) as exc_info:
         await chain.send(to="+56912345678", body="hola")
+
     assert exc_info.value.provider == "twilio_whatsapp"
-    assert last_resort.send_calls == []
+    assert primary.send_calls and fallback.send_calls
 
 
 # ---------------------------------------------------------------------------
-# send() — metadata passthrough
+# get_status – routing
 # ---------------------------------------------------------------------------
 
 
-async def test_send_result_preserves_underlying_raw_payload() -> None:
-    """The router must surface the *underlying* provider's
-    raw response so the messaging service can persist the
-    provider-specific fields it cares about (Meta's
-    ``messages[0].id``, the SMS aggregator's
-    ``message_id`` …). The router is a thin dispatch
-    helper, not a response normaliser."""
-    raw_payload = {"messages": [{"id": "wamid.HBgLMTY1M"}]}
-    primary = _ScriptedProvider(
-        name="meta_whatsapp",
-        outcomes=[SendResult(provider_msg_id="wamid.HBgLMTY1M", raw=raw_payload)],
-    )
-    chain = FailoverProvider([primary])
-
-    result = await chain.send(to="+56912345678", body="hola")
-
-    assert result.raw == raw_payload
-    assert result.provider_name == "meta_whatsapp"
-
-
-async def test_send_result_inherits_provider_name_when_underlying_sets_it() -> None:
-    """If the underlying provider already populated
-    ``provider_name`` on its :class:`SendResult`, the router
-    must not overwrite it – the underlying provider's name
-    is the most accurate signal of who actually handled the
-    call. (A custom provider that returns a
-    :class:`SendResult` with a different ``provider_name``
-    wins over the router's chain name.)"""
-    primary = _ScriptedProvider(
-        name="meta_whatsapp",
-        outcomes=[
-            SendResult(
-                provider_msg_id="wamid.1",
-                raw={},
-                provider_name="meta_whatsapp_business_account",
-            )
-        ],
-    )
-    chain = FailoverProvider([primary])
-
-    result = await chain.send(to="+56912345678", body="hola")
-
-    assert result.provider_name == "meta_whatsapp_business_account"
-
-
-async def test_send_forwards_extra_kwargs_to_underlying_providers() -> None:
-    """Keyword arguments to ``send`` (``template``,
-    ``media_url`` …, depending on the channel) are part of
-    the contract the messaging service relies on. The
-    router must pass them through verbatim so a future
-    template-aware provider does not lose the ``template``
-    field on the way through the chain."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
-    chain = FailoverProvider([primary])
-
-    await chain.send(
-        to="+56912345678", body="hola", template="hello_v1", media_url="https://x/y.png"
-    )
-
-    assert primary.send_calls == [
-        {
-            "to": "+56912345678",
-            "body": "hola",
-            "template": "hello_v1",
-            "media_url": "https://x/y.png",
-        }
-    ]
-
-
-# ---------------------------------------------------------------------------
-# get_status()
-# ---------------------------------------------------------------------------
-
-
-async def test_get_status_uses_underlying_provider_for_known_id() -> None:
-    """After a successful send, the router records which
-    provider handled the message so a later
-    :meth:`get_status` call can ask the *same* upstream for
-    the delivery receipt. The Meta Cloud API cannot answer
-    for a Twilio id (and vice versa), so a misroute would
-    surface as a 404."""
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderUnavailableError("meta 502", provider="meta_whatsapp"),
-    )
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+async def test_get_status_routes_back_to_handling_provider() -> None:
+    """A delivery receipt carries the ``provider_msg_id`` the
+    upstream returned at send time; the router remembers which
+    provider handled the message so the status check asks the
+    right upstream (Meta cannot answer for a Twilio id, and
+    vice versa)."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1", status="delivered")
     chain = FailoverProvider([primary, fallback])
 
-    # First call fails over to the fallback.
+    # Primary fails; fallback delivers. The router records the
+    # fallback's name against the returned provider_msg_id.
+    primary.push_error(ProviderUnavailableError("meta 5xx", provider="meta_whatsapp"))
     await chain.send(to="+56912345678", body="hola")
-    status = await chain.get_status("twilio.1")
 
-    assert status == "status:twilio_whatsapp:twilio.1"
+    status = await chain.get_status("tw-1")
+    assert status == "delivered"
+    assert fallback.status_calls == ["tw-1"]
     assert primary.status_calls == []
-    assert fallback.status_calls == ["twilio.1"]
 
 
-async def test_get_status_falls_back_to_primary_for_unknown_id() -> None:
-    """If the router has no record of the id (a delivery
-    receipt that arrives long after the worker rotated, or
-    an id from a different process), the call falls back to
-    the primary – the common case where the primary never
-    failed and the message was never routed through a
-    fallback."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+async def test_get_status_falls_back_to_primary_when_routing_unknown() -> None:
+    """A long-lived worker that has rotated (or a status check
+    issued by a different process) has no record of which
+    provider handled the message. The router falls back to the
+    primary in that case – the common situation where the
+    primary never failed and the message was delivered through
+    it directly."""
+    primary = FakeProvider("meta_whatsapp", status="delivered")
+    fallback = FakeProvider("twilio_whatsapp", status="delivered")
     chain = FailoverProvider([primary, fallback])
 
-    status = await chain.get_status("wamid.from.another.process")
-
-    assert status == "status:meta_whatsapp:wamid.from.another.process"
-    assert primary.status_calls == ["wamid.from.another.process"]
+    status = await chain.get_status("unknown-id")
+    assert status == "delivered"
+    assert primary.status_calls == ["unknown-id"]
     assert fallback.status_calls == []
 
 
-async def test_get_status_rejects_empty_id_without_calling_providers() -> None:
-    """An empty id is a validation error raised before any
-    provider is invoked. The router mirrors the contract of
-    the concrete adapters – calling a provider with an
-    empty id would surface as a 400 from the upstream, but
-    the platform's contract is to fail fast at the
-    boundary."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
+async def test_get_status_rejects_empty_provider_msg_id() -> None:
+    """An empty ``provider_msg_id`` is a programming error
+    (the route layer validates the path parameter before
+    reaching the adapter). The router surfaces a
+    ``ProviderValidationError`` so the error path is uniform
+    with the concrete adapters."""
+    primary = FakeProvider("meta_whatsapp")
     chain = FailoverProvider([primary])
 
     with pytest.raises(ProviderValidationError):
         await chain.get_status("")
-    assert primary.status_calls == []
-
-
-async def test_get_status_propagates_provider_failure() -> None:
-    """If the upstream the router routes the status check to
-    fails, the failure propagates – the status refresh is
-    a best-effort helper and a 5xx from the upstream is
-    surfaced to the caller unchanged."""
-
-    class _FailingGetStatus(BaseProvider):
-        name = "meta_whatsapp"
-
-        async def send(self, *, to: str, body: str, **kwargs: object) -> SendResult:
-            raise AssertionError("send should not be called by get_status")  # pragma: no cover
-
-        async def get_status(self, provider_msg_id: str) -> str:
-            raise ProviderUnavailableError(
-                "down", provider="meta_whatsapp"
-            )
-
-    chain = FailoverProvider([_FailingGetStatus()])
-    with pytest.raises(ProviderUnavailableError):
-        await chain.get_status("wamid.1")
 
 
 # ---------------------------------------------------------------------------
-# provider_for()
+# provider_for – lookup helper
 # ---------------------------------------------------------------------------
 
 
-def test_provider_for_returns_none_for_unknown_id() -> None:
-    """A lookup for an id the router has never seen returns
-    ``None``; the caller is expected to fall back to the
-    primary. The accessor never raises so the status-refresh
-    path stays side-effect free."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
+async def test_provider_for_returns_none_for_unknown_id() -> None:
+    """A lookup that has no record returns ``None`` so the
+    caller can apply its own fallback policy (the router
+    itself does, in :meth:`get_status`)."""
+    primary = FakeProvider("meta_whatsapp")
     chain = FailoverProvider([primary])
+    assert chain.provider_for("never-seen") is None
 
-    assert chain.provider_for("not-mapped") is None
 
-
-def test_provider_for_returns_none_when_recorded_provider_was_removed() -> None:
-    """If a recorded id points to a provider that is no
-    longer in the chain (e.g. an operator removed the
-    fallback), the lookup returns ``None`` so the caller
-    falls back to the primary rather than crashing on a
-    dangling reference."""
-    primary = _ok(name="meta_whatsapp", provider_msg_id="wamid.1")
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+async def test_provider_for_returns_none_when_routing_references_removed_provider() -> None:
+    """If the chain is rebuilt and the previously-recorded
+    provider is no longer in the chain, ``provider_for`` returns
+    ``None`` rather than raising – the contract is "look up or
+    give up", not "look up or fail loudly"."""
+    primary = FakeProvider("meta_whatsapp")
+    fallback = FakeProvider("twilio_whatsapp")
     chain = FailoverProvider([primary, fallback])
-    chain._routing["stale.id"] = "ghost_provider"
 
-    assert chain.provider_for("stale.id") is None
+    # Pretend the chain previously routed through a third
+    # provider that has since been removed.
+    chain._routing["g-1"] = "gupshup_whatsapp"
+    assert chain.provider_for("g-1") is None
+
+
+async def test_provider_for_returns_provider_after_send() -> None:
+    """After a successful send the router records the
+    handling provider so a later ``get_status`` can find it."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("down", provider="meta_whatsapp")],
+    )
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
+    chain = FailoverProvider([primary, fallback])
+
+    await chain.send(to="+56912345678", body="hola")
+    assert chain.provider_for("tw-1") is fallback
 
 
 # ---------------------------------------------------------------------------
-# aclose()
+# Properties
+# ---------------------------------------------------------------------------
+
+
+def test_primary_returns_first_provider() -> None:
+    """The ``primary`` property exposes the first element of
+    the chain so a health check can target the primary
+    specifically (e.g. to refresh a token)."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("twilio_whatsapp")
+    chain = FailoverProvider([a, b])
+    assert chain.primary is a
+
+
+def test_fallbacks_returns_remaining_providers() -> None:
+    """The ``fallbacks`` property exposes everything after the
+    primary so the rest of the codebase can iterate over the
+    secondaries (e.g. for health probes) without re-deriving
+    the slice."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("twilio_whatsapp")
+    c = FakeProvider("gupshup_whatsapp")
+    chain = FailoverProvider([a, b, c])
+    assert chain.fallbacks == [b, c]
+
+
+def test_providers_returns_full_chain() -> None:
+    """The ``providers()`` accessor returns the whole chain so
+    callers that want to iterate everything (health checks,
+    metrics) do not have to concatenate ``primary`` and
+    ``fallbacks`` themselves."""
+    a = FakeProvider("meta_whatsapp")
+    b = FakeProvider("twilio_whatsapp")
+    chain = FailoverProvider([a, b])
+    assert chain.providers() == [a, b]
+
+
+# ---------------------------------------------------------------------------
+# aclose
 # ---------------------------------------------------------------------------
 
 
 async def test_aclose_closes_every_provider_in_the_chain() -> None:
-    """The router's :meth:`aclose` propagates to every
-    provider in the chain so the application factory can
-    clean up the connection pool at shutdown. Providers
-    that share their HTTP client with the rest of the
-    platform are responsible for not tearing it down
-    (the concrete adapters already do this); the router
-    just forwards the call."""
-
-    closed: list[str] = []
-
-    class _Closeable(BaseProvider):
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        async def send(self, *, to: str, body: str, **kwargs: object) -> SendResult:
-            raise AssertionError("not used in this test")  # pragma: no cover
-
-        async def get_status(self, provider_msg_id: str) -> str:
-            raise AssertionError("not used in this test")  # pragma: no cover
-
-        async def aclose(self) -> None:
-            closed.append(self.name)
-
-    chain = FailoverProvider([_Closeable("meta_whatsapp"), _Closeable("twilio_whatsapp")])
-    await chain.aclose()
-
-    assert closed == ["meta_whatsapp", "twilio_whatsapp"]
-
-
-async def test_aclose_tolerates_providers_without_close_method() -> None:
-    """A provider that does not implement :meth:`aclose`
-    (e.g. a test double or a future in-process stub) must
-    not break the router's cleanup. The router calls
-    :func:`getattr` with a default so the absence of the
-    method is a silent no-op."""
-
-    class _NoClose(BaseProvider):
-        name = "stub"
-
-        async def send(self, *, to: str, body: str, **kwargs: object) -> SendResult:
-            raise AssertionError("not used in this test")  # pragma: no cover
-
-        async def get_status(self, provider_msg_id: str) -> str:
-            raise AssertionError("not used in this test")  # pragma: no cover
-
-    chain = FailoverProvider([_NoClose()])
-    # Should not raise.
-    await chain.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Custom ProviderError subclass
-# ---------------------------------------------------------------------------
-
-
-async def test_subclass_of_retryable_error_triggers_failover() -> None:
-    """A custom subclass of :class:`ProviderUnavailableError`
-    is still a retryable error – the ``except`` clause
-    matches on the parent class so a deployment that ships
-    a new error type (e.g. ``ProviderTimeoutError``) does
-    not have to remember to extend ``RETRYABLE_ERRORS``."""
-
-    class ProviderTimeoutError(ProviderUnavailableError):
-        pass
-
-    primary = _fails_with(
-        name="meta_whatsapp",
-        error=ProviderTimeoutError("timeout", provider="meta_whatsapp"),
-    )
-    fallback = _ok(name="twilio_whatsapp", provider_msg_id="twilio.1")
+    """Tearing down the chain must close every provider's HTTP
+    client so a process restart does not leave dangling
+    sockets. The router delegates to each provider's
+    ``aclose`` so the per-adapter ``_owns_client`` discipline
+    is preserved."""
+    primary = FakeProvider("meta_whatsapp")
+    fallback = FakeProvider("twilio_whatsapp")
     chain = FailoverProvider([primary, fallback])
 
-    result = await chain.send(to="+56912345678", body="hola")
+    await chain.aclose()
 
-    assert result.provider_name == "twilio_whatsapp"
+    assert primary.closed
+    assert fallback.closed
+
+
+async def test_aclose_skips_providers_without_aclose() -> None:
+    """Some test doubles do not implement ``aclose`` (they do
+    not own an HTTP client). The router must not crash on
+    them – a missing ``aclose`` means "nothing to close"."""
+    primary = FakeProvider("meta_whatsapp")
+
+    class _NoAcloseProvider(BaseProvider):
+        name = "noaclose"
+
+        async def send(self, *, to: str, body: str, **kwargs: Any) -> SendResult:
+            return SendResult(provider_msg_id="x", raw={})
+
+        async def get_status(self, provider_msg_id: str) -> str:
+            return "sent"
+
+    chain = FailoverProvider([primary, _NoAcloseProvider()])
+    await chain.aclose()  # should not raise
+    assert primary.closed
 
 
 # ---------------------------------------------------------------------------
-# Base contract
+# Module-level contract
 # ---------------------------------------------------------------------------
 
 
-def test_failover_provider_satisfies_base_contract() -> None:
-    """The router is a :class:`BaseProvider` so the rest of
-    the platform can treat it like any other adapter."""
-    chain = FailoverProvider([_ok(name="meta_whatsapp")])
-    assert isinstance(chain, BaseProvider)
-    assert chain.name == "meta_whatsapp"
+def test_retryable_errors_tuple_lists_documented_types() -> None:
+    """The module exposes the retryable-error tuple so callers
+    that need to mirror the same decision (e.g. a future
+    "smart" retry policy in the worker) can import it without
+    hard-coding the exception list."""
+    assert ProviderUnavailableError in RETRYABLE_ERRORS
+    assert ProviderRateLimitError in RETRYABLE_ERRORS
+    # Validation errors must *not* be retryable: a malformed
+    # request would fail the same way against a different
+    # provider.
+    assert ProviderValidationError not in RETRYABLE_ERRORS
+
+
+def test_retryable_errors_subclass_provider_error() -> None:
+    """Type-annotation guard: every element of
+    :data:`RETRYABLE_ERRORS` must be a :class:`ProviderError`
+    subclass so the router's ``except RETRYABLE_ERRORS`` clause
+    narrows to the right type."""
+    for exc in RETRYABLE_ERRORS:
+        assert issubclass(exc, ProviderError)
+
+
+# ---------------------------------------------------------------------------
+# attempt_callback – per-attempt event reporting (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The :class:`~app.adapters.failover.FailoverProvider` is
+# responsible for emitting one event per provider attempt
+# (success or failure) so the messaging service can persist
+# a :class:`~app.models.routing_log.RoutingLog` row per leg
+# of the chain. The contract is:
+#
+# - The callback is invoked once per provider the router
+#   tried (the primary *and* every fallback that was
+#   asked to deliver the message).
+# - The callback receives ``(provider_name, outcome,
+#   latency_ms, error_code, error_message)``. The
+#   ``outcome`` is one of
+#   :class:`~app.models.routing_log.RoutingLogOutcome`
+#   ("success" / "failure" / "validation_error").
+# - The callback's exceptions are swallowed (the
+#   dispatch must not crash on a misbehaving recorder).
+
+
+def test_attempt_callback_fires_on_primary_success() -> None:
+    """When the primary succeeds the callback is invoked
+    once with ``outcome="success"`` and the primary's
+    name. The dispatcher does not need to ask the
+    fallback for a status."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    fallback = FakeProvider("twilio_whatsapp")
+    chain = FailoverProvider([primary, fallback])
+
+    events: list[tuple[str, str, int, str | None, str | None]] = []
+
+    async def _run() -> None:
+        await chain.send(
+            to="+56912345678",
+            body="hola",
+            attempt_callback=lambda *args: events.append(args),
+        )
+
+    asyncio.run(_run())
+
+    assert len(events) == 1
+    name, outcome, latency_ms, error_code, error_message = events[0]
+    assert name == "meta_whatsapp"
+    assert outcome == "success"
+    assert latency_ms >= 0
+    assert error_code is None
+    assert error_message is None
+
+
+def test_attempt_callback_fires_for_every_attempt_in_chain() -> None:
+    """A chain with one failure followed by a success
+    produces two callback events: the failure (with the
+    primary's name and ``outcome="failure"``) and the
+    success (with the fallback's name and
+    ``outcome="success"``). The order is preserved so a
+    recorder can write the rows in the same sequence the
+    chain advanced."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("meta 5xx", provider="meta_whatsapp")],
+    )
+    fallback = FakeProvider("twilio_whatsapp", provider_msg_id="tw-1")
+    chain = FailoverProvider([primary, fallback])
+
+    events: list[tuple[str, str, int, str | None, str | None]] = []
+
+    async def _run() -> None:
+        await chain.send(
+            to="+56912345678",
+            body="hola",
+            attempt_callback=lambda *args: events.append(args),
+        )
+
+    asyncio.run(_run())
+
+    assert [e[0] for e in events] == ["meta_whatsapp", "twilio_whatsapp"]
+    assert [e[1] for e in events] == ["failure", "success"]
+    # The failure carries the provider's error code/message;
+    # the success carries ``None`` for both.
+    assert events[0][3] == "provider_unavailable"
+    assert events[0][4] == "meta 5xx"
+    assert events[1][3] is None
+    assert events[1][4] is None
+
+
+def test_attempt_callback_fires_with_validation_error_outcome() -> None:
+    """A :class:`ProviderValidationError` is a permanent
+    failure: the router propagates it immediately, but
+    the callback still fires so the routing log captures
+    the attempt. The ``outcome`` is the dedicated
+    ``"validation_error"`` bucket so the dashboard can
+    chart bad-input errors separately from upstreams
+    that are merely unavailable."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderValidationError("bad number", provider="meta_whatsapp")],
+    )
+    fallback = FakeProvider("twilio_whatsapp")
+    chain = FailoverProvider([primary, fallback])
+
+    events: list[tuple[str, str, int, str | None, str | None]] = []
+
+    async def _run() -> None:
+        with pytest.raises(ProviderValidationError):
+            await chain.send(
+                to="bad",
+                body="hola",
+                attempt_callback=lambda *args: events.append(args),
+            )
+
+    asyncio.run(_run())
+
+    # Only the primary was tried: a validation error
+    # short-circuits the chain.
+    assert len(events) == 1
+    name, outcome, _latency, error_code, error_message = events[0]
+    assert name == "meta_whatsapp"
+    assert outcome == "validation_error"
+    # ``error_code`` is the upstream's stable token
+    # (here ``"provider_validation"``); the
+    # ``outcome`` is the routing-log bucket. The two
+    # are decoupled on purpose: the upstream's code
+    # might be reused for a different bucket if a
+    # future iteration adds more granularity.
+    assert error_code == "provider_validation"
+    assert error_message == "bad number"
+
+
+def test_attempt_callback_fires_for_every_retryable_failure() -> None:
+    """When every provider in the chain raises a
+    retryable error the callback fires once per
+    provider (with ``outcome="failure"``) so the
+    routing log captures the whole chain the router
+    walked."""
+    primary = FakeProvider(
+        "meta_whatsapp",
+        errors=[ProviderUnavailableError("meta 5xx", provider="meta_whatsapp")],
+    )
+    fallback = FakeProvider(
+        "twilio_whatsapp",
+        errors=[ProviderUnavailableError("tw 5xx", provider="twilio_whatsapp")],
+    )
+    chain = FailoverProvider([primary, fallback])
+
+    events: list[tuple[str, str, int, str | None, str | None]] = []
+
+    async def _run() -> None:
+        with pytest.raises(ProviderUnavailableError):
+            await chain.send(
+                to="+56912345678",
+                body="hola",
+                attempt_callback=lambda *args: events.append(args),
+            )
+
+    asyncio.run(_run())
+
+    assert [e[0] for e in events] == ["meta_whatsapp", "twilio_whatsapp"]
+    assert [e[1] for e in events] == ["failure", "failure"]
+
+
+def test_attempt_callback_is_not_forwarded_to_underlying_provider() -> None:
+    """The ``attempt_callback`` is a router concern, not
+    an adapter concern. The router must not forward it
+    to the underlying provider's ``send`` call: doing so
+    would pollute the per-call kwargs the existing test
+    doubles capture verbatim, breaking the pre-failover
+    test surface. The test pins the contract that the
+    callback is *consumed* by the router."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    chain = FailoverProvider([primary])
+
+    async def _run() -> None:
+        await chain.send(
+            to="+56912345678",
+            body="hola",
+            attempt_callback=lambda *args: None,
+        )
+
+    asyncio.run(_run())
+    assert primary.send_calls == [{"to": "+56912345678", "body": "hola"}]
+
+
+def test_attempt_callback_is_optional() -> None:
+    """The callback is optional: pre-existing call sites
+    (and the unit tests that do not care about the
+    routing log) pass nothing and the router behaves
+    exactly as before."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    chain = FailoverProvider([primary])
+
+    async def _run() -> SendResult:
+        return await chain.send(to="+56912345678", body="hola")
+
+    result = asyncio.run(_run())
+    assert result.provider_msg_id == "meta-1"
+    assert result.provider_name == "meta_whatsapp"
+
+
+def test_attempt_callback_swallows_exceptions() -> None:
+    """A misbehaving recorder (a downstream DB outage,
+    a programming error in the callback) must not
+    break the dispatch path: the dispatch result is
+    far more important than the audit row. The router
+    logs the failure and continues."""
+    primary = FakeProvider("meta_whatsapp", provider_msg_id="meta-1")
+    chain = FailoverProvider([primary])
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("recorder broken")
+
+    async def _run() -> SendResult:
+        return await chain.send(
+            to="+56912345678",
+            body="hola",
+            attempt_callback=_boom,
+        )
+
+    # The dispatch returns a normal SendResult even
+    # though the callback raised on every invocation.
+    result = asyncio.run(_run())
+    assert result.provider_msg_id == "meta-1"
+

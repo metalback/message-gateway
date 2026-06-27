@@ -37,10 +37,11 @@ not need to support dynamic registration.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from app.adapters.base import BaseProvider
+from app.adapters.errors import ProviderError
 from app.adapters.failover import FailoverProvider
 from app.models.message import Channel
 
@@ -100,7 +101,8 @@ _BUILDERS: dict[Channel, Callable[[Settings], BaseProvider]] = {
 # ``Settings.provider_failover_chains``. An empty map means the
 # platform only knows the two primaries above – the MVP's pre-
 # failover surface area. A new fallback provider is added by
-# registering a factory here.
+# registering a factory here (or via
+# :func:`register_failover_provider` from a test).
 _FAILOVER_BUILDERS: dict[str, Callable[[Settings], BaseProvider]] = {
     "meta_whatsapp": _build_meta_whatsapp,
     "sms_aggregator": _build_sms_aggregator,
@@ -129,7 +131,12 @@ def register_failover_provider(
 # ---------------------------------------------------------------------------
 
 
-def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
+def get_provider(
+    channel: Channel | str,
+    *,
+    settings: Settings,
+    inactive: Iterable[str] | None = None,
+) -> BaseProvider:
     """Return the provider that owns ``channel``.
 
     The function honours the failover configuration in
@@ -146,9 +153,24 @@ def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
     registry in the first place, but if it does we want a
     clear error rather than a ``KeyError``).
 
+    ``inactive`` is the kill-switch set (issue #11) – a
+    collection of provider names the operator has flipped
+    off on the admin dashboard. The registry filters them
+    out of the chain *before* constructing the
+    :class:`FailoverProvider`, so the resulting wrapper only
+    contains providers that are eligible to receive traffic.
+    A primary that the operator disabled is dropped from the
+    chain head; the next active provider becomes the new
+    primary. ``None`` (or an empty iterable) keeps the
+    pre-kill-switch behaviour bit-for-bit.
+
     Raises :class:`UnsupportedChannelError` for channels the
-    platform does not know about. The route layer maps the
-    exception to a 422 response.
+    platform does not know about, and
+    :class:`AllProvidersDisabledError` when every provider in
+    the chain is in the kill-switch set. The route layer
+    maps the channel error to a 422 and the all-disabled
+    error to a 503 (the platform is healthy but cannot
+    fulfil the request through the configured providers).
     """
     if isinstance(channel, str):
         try:
@@ -166,9 +188,20 @@ def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
             channel=channel,
         ) from exc
 
+    inactive_set: set[str] = set(inactive or ())
     chain_setting = settings.provider_failover_chains.get(channel.value)
     primary = primary_factory(settings)
     if not chain_setting:
+        # No chain configured: the kill-switch either keeps
+        # the primary in place or returns nothing. The single-
+        # provider path is the common case for a deployment
+        # that has not opted into failover.
+        if primary.name in inactive_set:
+            raise AllProvidersDisabledError(
+                f"channel {channel.value!r} has no active provider "
+                f"({primary.name!r} is disabled)",
+                channel=channel,
+            )
         return primary
     # The primary must be the chain's first element – the
     # failover contract is "primary first, then fallbacks". We
@@ -190,9 +223,25 @@ def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
                 name=name,
             ) from exc
         chain_providers.append(factory(settings))
-    if len(chain_providers) == 1:
-        return primary
-    return FailoverProvider(chain_providers)
+    # Apply the kill-switch: drop every provider the
+    # operator disabled, then drop the prepended primary if
+    # it is also disabled. The list is *rebuilt* in order
+    # (a surviving fallback may need to take the head of
+    # the chain).
+    active_providers: list[BaseProvider] = [
+        provider
+        for provider in chain_providers
+        if provider.name not in inactive_set
+    ]
+    if not active_providers:
+        raise AllProvidersDisabledError(
+            f"channel {channel.value!r} has no active provider "
+            f"(disabled names: {sorted(inactive_set & {p.name for p in chain_providers})!r})",
+            channel=channel,
+        )
+    if len(active_providers) == 1:
+        return active_providers[0]
+    return FailoverProvider(active_providers)
 
 
 def supported_channels() -> list[Channel]:
@@ -236,7 +285,38 @@ class UnsupportedProviderError(ValueError):
         self.name = name
 
 
+class AllProvidersDisabledError(ProviderError):
+    """Raised when every provider in a channel is disabled.
+
+    Subclasses :class:`ProviderError` so the route layer's
+    existing ``_raise_provider_error`` helper maps the
+    failure to a stable HTTP response (503 Service
+    Unavailable, ``code="provider_disabled"``) without a
+    new exception branch. The exception carries the
+    channel so the operator's logs can be filtered to
+    "all providers disabled for X" without having to
+    re-parse the message string.
+
+    The 503 (rather than 502 like the other
+    :class:`ProviderError` subclasses) is intentional:
+    the upstream providers may well be healthy – the
+    platform itself is the one refusing to dispatch,
+    because the operator has flipped every kill-switch
+    off. 503 is the closest match in the HTTP vocabulary
+    ("I cannot fulfil the request right now") without
+    being a 5xx from the upstream.
+    """
+
+    http_status = 503
+    code = "provider_disabled"
+
+    def __init__(self, message: str, *, channel: Channel) -> None:
+        super().__init__(message, provider=None)
+        self.channel = channel
+
+
 __all__ = (
+    "AllProvidersDisabledError",
     "UnsupportedChannelError",
     "UnsupportedProviderError",
     "get_provider",
