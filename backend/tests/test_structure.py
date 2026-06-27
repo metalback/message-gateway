@@ -178,15 +178,16 @@ def test_placeholder_routes_return_not_implemented() -> None:
     ``501 Not Implemented`` so the contract is explicit: the path
     exists, the feature doesn't yet. The auth ``/register`` and
     ``/login`` endpoints are no longer placeholders (issue #3),
-    and the message-sending endpoints are no longer placeholders
-    (issue #4), and the billing endpoints are no longer placeholders
-    (issue #7), so they are excluded from this list."""
+    the message-sending endpoints are no longer placeholders
+    (issue #4), the billing endpoints are no longer placeholders
+    (issue #7), and the webhook endpoints are no longer
+    placeholders (issue #5) – so they are excluded from this
+    list."""
     app = create_app(Settings())
     client = TestClient(app)
 
     cases = (
         ("GET", "/v1/templates", 501),
-        ("GET", "/v1/webhooks", 501),
     )
     for method, path, expected_status in cases:
         response = client.request(method, path)
@@ -236,5 +237,29 @@ def test_messages_send_endpoint_is_implemented() -> None:
     )
     assert response.status_code != 501, (
         "POST /v1/messages must be implemented (issue #4), "
+        "not the scaffold 501 placeholder"
+    )
+
+
+def test_webhooks_endpoints_are_implemented() -> None:
+    """``GET /v1/webhooks`` was a placeholder until issue #5
+    landed; the test guards against a regression that would
+    re-introduce the 501 behaviour now that the endpoints
+    are real.
+
+    As with :func:`test_messages_send_endpoint_is_implemented`,
+    the request is intentionally missing a valid API key so
+    the dependency short-circuits with a 401 (not a 501). The
+    assertion is the *not-501* half of the contract: as long
+    as the endpoint behaves like a real handler (it consults
+    the API-key dependency instead of stubbing the
+    response), the placeholder contract is dead.
+    """
+    app = create_app(Settings())
+    client = TestClient(app)
+
+    response = client.get("/v1/webhooks")
+    assert response.status_code != 501, (
+        "GET /v1/webhooks must be implemented (issue #5), "
         "not the scaffold 501 placeholder"
     )
