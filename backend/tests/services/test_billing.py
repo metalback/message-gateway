@@ -153,8 +153,9 @@ def _make_message(
     """Build a :class:`Message` row with the minimum fields the service reads."""
     return Message(
         client_id=client_id,
+        provider="test",
         channel="sms",
-        to_hash="hashed-recipient",
+        to_number="+56912345678",
         body="hello",
         status=status,
         fee_clp=fee,
@@ -333,11 +334,11 @@ async def test_compute_invoice_over_limit_includes_overage(
 async def test_compute_invoice_excludes_non_billable_messages(
     async_session, fast_settings, starter_client
 ) -> None:
-    """Queued / failed / undelivered messages do not count towards billing."""
+    """Queued / pending / failed messages do not count towards billing."""
     statuses = [MessageStatus.SENT.value] * 800
     statuses += [MessageStatus.QUEUED.value] * 100
     statuses += [MessageStatus.FAILED.value] * 50
-    statuses += [MessageStatus.UNDELIVERED.value] * 25
+    statuses += [MessageStatus.PENDING.value] * 25
     await _seed_messages(
         async_session, client_id=starter_client.id, statuses=statuses
     )

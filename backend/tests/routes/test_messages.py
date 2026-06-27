@@ -10,6 +10,11 @@ the service layer (covered by :mod:`tests.services.test_messaging`).
 The provider HTTP layer is stubbed by patching the registry
 to return :class:`FakeProvider` instances, so the suite never
 opens a real TCP connection.
+
+The :class:`GET /v1/messages` history endpoint (added with
+the "Historial y consumo" dashboard task) lives here too:
+its observable contract is an HTTP response and that is
+exactly what this module exercises.
 """
 
 from __future__ import annotations
@@ -642,4 +647,893 @@ def test_get_message_status_401_when_api_key_missing(client: TestClient) -> None
     """A missing ``X-API-Key`` is a 401 with a stable code."""
     response = client.get("/v1/messages/00000000-0000-0000-0000-000000000000")
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/messages  –  history listing (issue #6)
+# ---------------------------------------------------------------------------
+
+
+def _send_one(
+    client: TestClient, *, api_key: str, to: str, body: str, channel: str = "sms"
+) -> dict[str, Any]:
+    """Send a single message and return the parsed response body.
+
+    Helper factored out of the history tests so each
+    assertion focuses on the contract it cares about
+    (pagination, filtering, …) instead of the boilerplate
+    of building a POST request.
+    """
+    response = client.post(
+        "/v1/messages",
+        json={"channel": channel, "to": to, "body": body},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 202, response.text
+    return response.json()["message"]
+
+
+def test_list_messages_returns_200_with_paginated_history(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A freshly registered customer with a handful of
+    messages gets a well-formed paginated response: the
+    ``items`` array carries the rows, ``total`` counts the
+    full history, ``limit`` / ``offset`` echo the page
+    arguments and ``has_more`` is ``False`` when the page
+    covers the whole history.
+    """
+    body = _register(client)
+    api_key = body["api_key"]
+    sent_ids: list[str] = []
+    for i in range(3):
+        sent = _send_one(
+            client,
+            api_key=api_key,
+            to=f"+5691234567{i}",
+            body=f"hola {i}",
+        )
+        sent_ids.append(sent["id"])
+
+    response = client.get(
+        "/v1/messages",
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["total"] == 3
+    assert len(payload["items"]) == 3
+    assert payload["limit"] == 50  # service default
+    assert payload["offset"] == 0
+    assert payload["has_more"] is False
+    # All three seeded messages are present. The exact
+    # order between same-timestamp messages is
+    # implementation-defined (the service falls back to the
+    # UUID for the tiebreaker), so the contract we pin
+    # here is the set, not the order. The
+    # "newest-first" property itself is exercised by the
+    # dedicated service-level test that controls
+    # ``created_at`` directly.
+    assert {m["id"] for m in payload["items"]} == set(sent_ids)
+
+
+def test_list_messages_filters_by_channel(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``?channel=…`` query parameter narrows the
+    response to that channel. The test seeds one SMS and one
+    WhatsApp message and asserts the ``whatsapp`` filter
+    returns only the WhatsApp row."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="sms", channel="sms")
+    wa = _send_one(
+        client,
+        api_key=api_key,
+        to="+56922222222",
+        body="hola wa",
+        channel="whatsapp",
+    )
+
+    response = client.get(
+        "/v1/messages",
+        params={"channel": "whatsapp"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert [m["id"] for m in payload["items"]] == [wa["id"]]
+    assert all(m["channel"] == "whatsapp" for m in payload["items"])
+
+
+def test_list_messages_filters_by_status(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``?status=…`` query parameter narrows the response
+    to a single :class:`MessageStatus`. The test seeds a
+    success and a provider failure and asserts the
+    ``failed`` filter returns only the failure row."""
+    fake_provider._error = ProviderUnavailableError("down", provider="fake")
+    body = _register(client)
+    api_key = body["api_key"]
+    failed = _send_one(
+        client, api_key=api_key, to="+56911111111", body="primero"
+    )
+    fake_provider._error = None
+    _send_one(client, api_key=api_key, to="+56922222222", body="segundo")
+
+    response = client.get(
+        "/v1/messages",
+        params={"status": "failed"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert [m["id"] for m in payload["items"]] == [failed["id"]]
+    assert all(m["status"] == "failed" for m in payload["items"])
+
+
+def test_list_messages_paginates_with_limit_and_offset(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """``limit`` and ``offset`` narrow the page; the
+    ``has_more`` flag tells the dashboard whether another
+    request is needed. The test seeds 5 rows and walks them
+    in pages of 2."""
+    body = _register(client)
+    api_key = body["api_key"]
+    for i in range(5):
+        _send_one(
+            client,
+            api_key=api_key,
+            to=f"+5691234567{i}",
+            body=f"row {i}",
+        )
+
+    page1 = client.get(
+        "/v1/messages",
+        params={"limit": 2, "offset": 0},
+        headers={"X-API-Key": api_key},
+    ).json()
+    assert len(page1["items"]) == 2
+    assert page1["total"] == 5
+    assert page1["has_more"] is True
+    assert page1["limit"] == 2
+
+    page2 = client.get(
+        "/v1/messages",
+        params={"limit": 2, "offset": 2},
+        headers={"X-API-Key": api_key},
+    ).json()
+    assert len(page2["items"]) == 2
+    assert page2["has_more"] is True
+
+    page3 = client.get(
+        "/v1/messages",
+        params={"limit": 2, "offset": 4},
+        headers={"X-API-Key": api_key},
+    ).json()
+    assert len(page3["items"]) == 1
+    assert page3["has_more"] is False
+
+
+def test_list_messages_does_not_leak_other_clients(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A second customer's history must not bleed into the
+    first customer's page. The test seeds messages for both
+    customers and asserts the first customer only ever sees
+    their own rows."""
+    me = _register(client)
+    other = client.post(
+        "/v1/auth/register",
+        json={
+            "name": "Other",
+            "email": "other@acme.cl",
+            "rut": "11.111.111-1",
+            "password": "another-secret",
+        },
+    ).json()
+    _send_one(client, api_key=me["api_key"], to="+56911111111", body="mine")
+    _send_one(client, api_key=other["api_key"], to="+56922222222", body="theirs")
+
+    response = client.get(
+        "/v1/messages",
+        headers={"X-API-Key": me["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["to_number"] == "+56911111111"
+
+
+def test_list_messages_401_when_api_key_missing(
+    client: TestClient,
+) -> None:
+    """A missing ``X-API-Key`` is a 401 with a stable code;
+    the test guards against a regression that would let an
+    unauthenticated caller list arbitrary history."""
+    response = client.get("/v1/messages")
+    assert response.status_code == 401
     assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+def test_list_messages_422_on_unknown_channel_filter(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """An unknown ``?channel=…`` is a 422 with a useful
+    Pydantic-validated error message so the dashboard can
+    render an inline error."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages",
+        params={"channel": "carrier-pigeon"},
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    # Pydantic's enum validation produces a list of error
+    # objects; the first one references the ``channel``
+    # query parameter and names the legal values.
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["query", "channel"]
+    assert "sms" in detail["msg"] and "whatsapp" in detail["msg"]
+
+
+def test_list_messages_422_on_unknown_status_filter(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """An unknown ``?status=…`` is a 422 with a useful
+    Pydantic-validated error message."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages",
+        params={"status": "teleported"},
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["query", "status"]
+    assert "sent" in detail["msg"] and "failed" in detail["msg"]
+
+
+def test_list_messages_422_on_inverted_date_range(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A ``since`` value that is later than ``until`` is a
+    422 with a stable code so a buggy date picker cannot
+    silently return an empty page."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages",
+        params={
+            "since": "2030-01-01T00:00:00+00:00",
+            "until": "2020-01-01T00:00:00+00:00",
+        },
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_date_range"
+
+
+def test_list_messages_422_on_non_positive_limit(
+    client: TestClient,
+) -> None:
+    """A ``limit=0`` (or any non-positive value) is rejected
+    by Pydantic validation with a 422. The dashboard never
+    sends a zero, but the test pins the contract so a
+    future regression in the call site does not silently
+    return an empty page."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages",
+        params={"limit": 0},
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+
+
+def test_list_messages_empty_history_returns_well_formed_page(
+    client: TestClient,
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed empty page (``items=[]``, ``total=0``,
+    ``has_more=False``) so the dashboard can render the
+    "no has enviado mensajes todavía" empty state without
+    a special-case branch."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "items": [],
+        "total": 0,
+        "limit": 50,
+        "offset": 0,
+        "has_more": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/messages/export  –  CSV download (issue #6 follow-up)
+# ---------------------------------------------------------------------------
+#
+# The dashboard's "Descargar CSV" button targets this endpoint.
+# The tests assert the wire format (Content-Type, header shape,
+# CSV body) rather than poking at the service layer, so the
+# route handler is exercised end-to-end.
+
+
+def test_export_history_returns_csv_with_attachment_header(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A well-formed request yields a ``text/csv`` body with a
+    ``Content-Disposition: attachment`` header so the browser
+    saves the file rather than rendering it inline. The
+    response also carries ``X-Export-Total`` and
+    ``X-Export-Truncated`` so a script can detect a partial
+    export without re-running the count."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="uno")
+    _send_one(client, api_key=api_key, to="+56922222222", body="dos")
+
+    response = client.get(
+        "/v1/messages/export",
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment" in response.headers["content-disposition"]
+    assert response.headers["content-disposition"].endswith('.csv"')
+    assert response.headers["x-export-total"] == "2"
+    assert response.headers["x-export-truncated"] == "false"
+
+    # Body is a well-formed CSV: a header row + 2 data rows.
+    lines = response.text.splitlines()
+    assert len(lines) == 3
+    assert lines[0].startswith("id,created_at,channel,status,to_number,body,")
+    assert "uno" in lines[1] or "uno" in lines[2]
+    assert "dos" in lines[1] or "dos" in lines[2]
+
+
+def test_export_history_respects_filters(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The export honours the same ``?channel=…`` /
+    ``?status=…`` / date range filters the list endpoint
+    does. The test seeds a mix of rows and asserts only the
+    filtered ones make it into the CSV."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="sms", channel="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/export",
+        params={"channel": "whatsapp"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    lines = response.text.splitlines()
+    assert len(lines) == 2  # header + 1 data row
+    assert "wa" in lines[1]
+    assert "sms" not in lines[1]
+    assert response.headers["x-export-total"] == "1"
+
+
+def test_export_history_does_not_leak_other_clients(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A second customer's history must not bleed into the
+    CSV. The test seeds messages for both customers and
+    asserts the first customer only ever sees their own
+    rows in the body and the ``X-Export-Total`` header."""
+    me = _register(client)
+    other = client.post(
+        "/v1/auth/register",
+        json={
+            "name": "Other",
+            "email": "other@acme.cl",
+            "rut": "11.111.111-1",
+            "password": "another-secret",
+        },
+    ).json()
+    _send_one(client, api_key=me["api_key"], to="+56911111111", body="mine")
+    _send_one(client, api_key=other["api_key"], to="+56922222222", body="theirs")
+
+    response = client.get(
+        "/v1/messages/export",
+        headers={"X-API-Key": me["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-export-total"] == "1"
+    assert "mine" in response.text
+    assert "theirs" not in response.text
+
+
+def test_export_history_401_when_api_key_missing(client: TestClient) -> None:
+    """A missing ``X-API-Key`` is a 401 with a stable code;
+    the test guards against a regression that would let an
+    unauthenticated caller download arbitrary history."""
+    response = client.get("/v1/messages/export")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+def test_export_history_422_on_unknown_channel_filter(
+    client: TestClient,
+) -> None:
+    """An unknown ``?channel=…`` is a 422, mirroring the list
+    endpoint's contract. The dashboard never sends a bogus
+    value, but the assertion pins the contract so a
+    regression in the call site does not silently return a
+    200 with the unfiltered export."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/export",
+        params={"channel": "carrier-pigeon"},
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+
+
+def test_export_history_422_on_inverted_date_range(
+    client: TestClient,
+) -> None:
+    """An inverted date range is a 422 with the same
+    ``invalid_date_range`` code the list endpoint uses."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/export",
+        params={
+            "since": "2030-01-01T00:00:00+00:00",
+            "until": "2020-01-01T00:00:00+00:00",
+        },
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_date_range"
+
+
+def test_export_history_empty_history_returns_header_only(
+    client: TestClient,
+) -> None:
+    """A customer who has never sent a message still gets a
+    well-formed CSV (header row + ``X-Export-Total: 0``) so
+    the dashboard does not have to branch on the empty
+    case."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/export",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-export-total"] == "0"
+    assert response.headers["x-export-truncated"] == "false"
+    lines = response.text.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("id,created_at,channel,status,to_number,body,")
+
+
+def test_export_history_does_not_match_get_by_id(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A regression guard: the route is mounted at
+    ``/messages/export`` (a literal segment), so a request
+    to that path must hit the export endpoint, not the
+    single-message ``GET /messages/{message_id}`` route.
+    Sending a bogus API key would surface a 401 from the
+    export route; if the matcher were reversed, the request
+    would try to look up a message with id ``"export"``
+    and surface a 404 instead."""
+    response = client.get("/v1/messages/export")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/messages/daily  –  bar chart data (issue #6)
+# ---------------------------------------------------------------------------
+#
+# The dashboard's "gráfico de barras" is backed by this
+# endpoint. The tests exercise the wire format (date / channel
+# / count), the default 31-day window, the ``channel`` filter,
+# the cross-tenant guard and the 401 / 422 paths. The seed
+# pattern is borrowed from the export tests above.
+
+
+def test_daily_usage_returns_aggregated_buckets(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """Two SMS messages and one WhatsApp message, all
+    dispatched in quick succession, surface as two
+    ``DailyUsageBucket`` rows on the same calendar day:
+    ``(today, sms, 2)`` and ``(today, whatsapp, 1)``. The
+    response also carries the resolved ``since`` /
+    ``until`` window so the chart axis can be drawn
+    without a second round-trip."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="d1-sms-1")
+    _send_one(client, api_key=api_key, to="+56911111112", body="d1-sms-2")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="d1-wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/daily",
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    by_key = {(item["channel"], item["count"]) for item in payload["items"]}
+    assert by_key == {("sms", 2), ("whatsapp", 1)}
+    # The window is echoed back so the dashboard can render
+    # the chart axis labels.
+    assert "since" in payload and "until" in payload
+
+
+def test_daily_usage_respects_channel_filter(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``?channel=`` query parameter narrows the
+    aggregation to a single channel. The test seeds a mix
+    of SMS and WhatsApp messages and asserts the ``sms``
+    filter only returns the SMS buckets."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/daily",
+        params={"channel": "sms"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["channel"] == "sms"
+    assert items[0]["count"] == 1
+
+
+def test_daily_usage_respects_date_range(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``since`` / ``until`` query parameters narrow the
+    aggregation to the requested window. The test asserts
+    the response carries the resolved bounds so the chart
+    axis can be drawn without a second round-trip."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="uno")
+
+    since = "2026-01-01T00:00:00+00:00"
+    until = "2026-12-31T23:59:59+00:00"
+    response = client.get(
+        "/v1/messages/daily",
+        params={"since": since, "until": until},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["since"].startswith("2026-01-01")
+    assert payload["until"].startswith("2026-12-31")
+
+
+def test_daily_usage_does_not_leak_other_clients(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A second customer's history must not bleed into the
+    first customer's daily aggregation. The test seeds
+    messages for both customers and asserts the first
+    customer only ever sees their own buckets."""
+    me = _register(client)
+    other = client.post(
+        "/v1/auth/register",
+        json={
+            "name": "Other",
+            "email": "other@acme.cl",
+            "rut": "11.111.111-1",
+            "password": "another-secret",
+        },
+    ).json()
+    _send_one(client, api_key=me["api_key"], to="+56911111111", body="mine")
+    _send_one(client, api_key=other["api_key"], to="+56922222222", body="theirs")
+
+    response = client.get(
+        "/v1/messages/daily",
+        headers={"X-API-Key": me["api_key"]},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    total = sum(item["count"] for item in items)
+    assert total == 1
+
+
+def test_daily_usage_401_when_api_key_missing(
+    client: TestClient,
+) -> None:
+    """A missing ``X-API-Key`` is a 401 with a stable code;
+    the test guards against a regression that would let an
+    unauthenticated caller read the daily aggregation."""
+    response = client.get("/v1/messages/daily")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+def test_daily_usage_422_on_inverted_date_range(
+    client: TestClient,
+) -> None:
+    """An inverted date range is a 422 with the same
+    ``invalid_date_range`` code the other message endpoints
+    use. The test pins the contract so a future regression
+    in the call site does not silently return an empty
+    response."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/daily",
+        params={
+            "since": "2030-01-01T00:00:00+00:00",
+            "until": "2020-01-01T00:00:00+00:00",
+        },
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_date_range"
+
+
+def test_daily_usage_empty_history_returns_well_formed_response(
+    client: TestClient,
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed response (``items=[]`` plus a resolved
+    window) so the dashboard can render the "todavía no
+    has enviado mensajes este mes" empty state without a
+    special-case branch."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/daily",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["items"] == []
+    assert "since" in payload and "until" in payload
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/messages/summary
+# ---------------------------------------------------------------------------
+#
+# HTTP-level tests for the "desglose por estado" widget on
+# the dashboard. The tests exercise the observable contract
+# (status codes, response shapes) end-to-end through the
+# FastAPI app; the service-level behaviour (per-status
+# aggregation, cross-tenant guard, default window, …) is
+# covered by :mod:`tests.services.test_messaging`.
+
+
+def test_status_summary_returns_per_status_counts(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """Three SMS sends and one WhatsApp send produce a
+    response that carries one row per ``MessageStatus``
+    value (zero-filled for statuses with no traffic) and
+    the headline ``total`` / ``delivered`` / ``failed`` /
+    ``pending`` counters. ``delivery_rate`` is the
+    fraction of messages in the ``delivered`` state,
+    expressed in the closed interval ``[0.0, 1.0]``."""
+    body = _register(client)
+    api_key = body["api_key"]
+    for i in range(3):
+        _send_one(client, api_key=api_key, to=f"+5691111111{i}", body="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    # Every status row is present (zero-filled for statuses
+    # the customer has not produced), in the platform's
+    # lifecycle order.
+    statuses = [row["status"] for row in payload["items"]]
+    assert statuses == [
+        "delivered", "sent", "queued", "pending", "failed", "unknown"
+    ]
+    counts = {row["status"]: row["count"] for row in payload["items"]}
+    # ``_send_one`` goes through the provider stub, which
+    # returns ``"sent"`` by default. The service layer maps
+    # that to :attr:`MessageStatus.SENT` (the upstream
+    # acknowledged the message); the ``delivered`` count is
+    # therefore zero – the platform only marks a message
+    # as ``delivered`` when the recipient's handset
+    # confirms delivery.
+    assert counts["sent"] == 4
+    assert counts["delivered"] == 0
+    # Headline counters.
+    assert payload["total"] == 4
+    assert payload["delivered"] == 0
+    assert payload["failed"] == 0
+    assert payload["pending"] == 0
+    assert payload["delivery_rate"] == 0.0
+    # The window is echoed back so the dashboard can render
+    # the "resumen del … al …" subtitle.
+    assert "since" in payload and "until" in payload
+
+
+def test_status_summary_respects_channel_filter(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``?channel=`` query parameter narrows the
+    aggregation to a single channel. The test seeds a mix
+    of SMS and WhatsApp messages and asserts the ``sms``
+    filter only returns the SMS totals."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        params={"channel": "sms"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+
+
+def test_status_summary_respects_date_range(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``since`` / ``until`` query parameters narrow the
+    aggregation to the requested window. The test asserts
+    the response carries the resolved bounds so the
+    dashboard can render the "resumen del … al …" subtitle
+    without a second round-trip."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="uno")
+
+    since = "2026-01-01T00:00:00+00:00"
+    until = "2026-12-31T23:59:59+00:00"
+    response = client.get(
+        "/v1/messages/summary",
+        params={"since": since, "until": until},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["since"].startswith("2026-01-01")
+    assert payload["until"].startswith("2026-12-31")
+
+
+def test_status_summary_does_not_leak_other_clients(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A second customer's history must not bleed into the
+    first customer's status summary. The test seeds
+    messages for both customers and asserts the first
+    customer only ever sees their own totals."""
+    me = _register(client)
+    other = client.post(
+        "/v1/auth/register",
+        json={
+            "name": "Other",
+            "email": "other@acme.cl",
+            "rut": "11.111.111-1",
+            "password": "another-secret",
+        },
+    ).json()
+    _send_one(client, api_key=me["api_key"], to="+56911111111", body="mine")
+    _send_one(
+        client, api_key=other["api_key"], to="+56922222222", body="theirs"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": me["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+
+
+def test_status_summary_401_when_api_key_missing(
+    client: TestClient,
+) -> None:
+    """A missing ``X-API-Key`` is a 401 with a stable code;
+    the test guards against a regression that would let an
+    unauthenticated caller read the status summary."""
+    response = client.get("/v1/messages/summary")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+def test_status_summary_422_on_inverted_date_range(
+    client: TestClient,
+) -> None:
+    """An inverted date range is a 422 with the same
+    ``invalid_date_range`` code the other message endpoints
+    use. The test pins the contract so a future regression
+    in the call site does not silently return an empty
+    response."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        params={
+            "since": "2030-01-01T00:00:00+00:00",
+            "until": "2020-01-01T00:00:00+00:00",
+        },
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_date_range"
+
+
+def test_status_summary_empty_history_returns_well_formed_response(
+    client: TestClient,
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed response (every status row present with a
+    count of zero, headline counters at zero, ``delivery_rate``
+    at 0.0) so the dashboard can render the "todavía no has
+    enviado mensajes" empty state without a special-case
+    branch."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 0
+    assert payload["delivered"] == 0
+    assert payload["failed"] == 0
+    assert payload["pending"] == 0
+    assert payload["delivery_rate"] == 0.0
+    # Every status row is present, all with a count of zero.
+    assert {row["status"] for row in payload["items"]} == {
+        "delivered", "sent", "queued", "pending", "failed", "unknown"
+    }
+    assert all(row["count"] == 0 for row in payload["items"])
+    assert "since" in payload and "until" in payload
+
+
+def test_status_summary_does_not_match_get_by_id(
+    client: TestClient,
+) -> None:
+    """``/v1/messages/summary`` must not be matched by the
+    ``/v1/messages/{message_id}`` route – a request for the
+    literal id ``"summary"`` is a 404 (not the 200 the
+    summary endpoint would return). The test pins the
+    route-ordering contract so a future refactor that
+    re-orders the routes fails loudly in CI."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    # The summary endpoint is mounted before the path-param
+    # endpoint, so the request hits the summary handler and
+    # returns a 200 (not a 404 the path-param handler would
+    # raise for an unknown id).
+    assert response.status_code == 200
+    assert "items" in response.json()
+

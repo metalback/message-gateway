@@ -92,6 +92,98 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   already attached. Backed by
   `backend/tests/observability/test_logging.py` (handler
   identity, level normalisation, idempotency, fallback).
+- "Historial y consumo" usage dashboard (#6): a new
+  `GET /v1/messages` history endpoint and the first
+  Angular dashboard screen. The endpoint is a paginated,
+  filterable read of the authenticated customer's
+  message history (channel / status / date range
+  filters; `limit` / `offset` pagination; cross-tenant
+  guard; stable error codes for unknown filters and
+  inverted date ranges). The dashboard wires the new
+  endpoint together with the existing
+  `GET /v1/billing/balance` summary and ships a
+  feature module (`frontend/src/app/usage-dashboard/`)
+  with a `UsageDashboardService`,
+  `UsageDashboardComponent`, lazy-loaded routing and a
+  test suite that exercises the balance / history
+  fetch, the filter form and the "Cargar más"
+  pagination button. The root `AppComponent` gains a
+  real navigation header and the landing route
+  redirects to `/usage`. The backend is covered by 23
+  new tests (12 service-level, 11 HTTP-level) and the
+  frontend by a dedicated `*.spec.ts` for both the
+  service and the component.
+- "Historial y consumo" CSV export (issue #6 follow-up):
+  a new `GET /v1/messages/export` endpoint that streams
+  the customer's full history (respecting the same
+  `channel` / `status` / date range filters the on-screen
+  list uses) as a `text/csv` file with a
+  `Content-Disposition: attachment` header, plus a
+  "Descargar CSV" button on the dashboard. The export is
+  capped at 10,000 rows server-side; the response carries
+  an `X-Export-Truncated` header so a script can detect
+  a partial download. The backend is covered by 8 new
+  HTTP-level tests + 7 new service-level tests, and the
+  frontend by 3 new component tests + 4 new service
+  tests (the URL builder, the blob download via
+  `HttpClient`, the synthetic-anchor click, and the
+  default-filename fallback).
+- "Historial y consumo" daily chart + invoice list
+  (issue #6 follow-up): a new `GET /v1/messages/daily`
+  endpoint that returns per-day, per-channel message
+  counts (the resolved `since` / `until` window is
+  echoed in the response so the chart axis can be
+  drawn without mirroring the service's default-window
+  logic on the client) plus a "gráfico de barras" on
+  the dashboard that renders the data as a Tailwind-only
+  CSS bar chart (no Chart.js dependency). The endpoint
+  is covered by 8 new service tests + 7 new HTTP tests
+  (filter shape, cross-tenant guard, default window,
+  inverted / oversized date range, empty history, 401).
+  The invoice list renders a new "Historial de
+  facturación" section on the dashboard that calls the
+  existing `GET /v1/billing/invoices` endpoint and
+  projects the wire format into a per-invoice table
+  with a status badge, period / emission / due dates,
+  total CLP and a "Ver PDF" link to the DTE URL. The
+  service gains 4 new test suites (the daily-endpoint
+  HTTP contract, the filter normalisation, the
+  `dailyTotals` aggregator, the invoice-status labels
+  and badge classes) and the component gains 3 new
+  tests (chart rendering with N daily bars, the chart
+  empty state, the invoice list with a paid / issued
+  badge).
+- "Historial y consumo" status breakdown card
+  (issue #6 follow-up): a new `GET /v1/messages/summary`
+  endpoint that returns a per-status aggregate of the
+  customer's traffic for the resolved window (one row
+  per `MessageStatus` value, zero-filled for statuses
+  with no traffic) plus the headline counters the
+  dashboard surfaces in the "Desglose por estado" card
+  (`total` / `delivered` / `failed` / `pending`), the
+  summed `cost_clp` / `fee_clp` amounts, the
+  `delivery_rate` the widget renders as a Tailwind-only
+  progress bar and the resolved `since` / `until`
+  window. The endpoint is mounted at
+  `/messages/summary` (rather than the more natural
+  `/messages/{id}` path) so the literal segment keeps
+  FastAPI's route matcher from trying to resolve
+  `summary` as a message id. The backend is covered by
+  9 new service tests + 8 new HTTP tests (per-status
+  aggregation, zero-fill, cross-tenant guard, channel
+  and date-range filters, default 31-day window,
+  inverted / oversized range, empty history, 401, 422,
+  route-ordering guard). The dashboard renders a new
+  "Desglose por estado" card on top of the history
+  table that combines the delivery-rate progress bar,
+  the per-status breakdown list (with a coloured dot
+  per status) and a cost-summary footer (total cost,
+  total fee, average cost per message). The frontend
+  gains 3 new service tests (the new endpoint's HTTP
+  contract, the filter normalisation) and 4 new
+  component tests (the breakdown card on init, the
+  delivery-rate width / percent helpers, the average
+  cost helper, the empty-state render).
 
 ### Changed
 
