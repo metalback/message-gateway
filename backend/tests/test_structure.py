@@ -177,7 +177,8 @@ def test_placeholder_routes_return_not_implemented() -> None:
     """Every placeholder endpoint in :mod:`app.routes` returns
     ``501 Not Implemented`` so the contract is explicit: the path
     exists, the feature doesn't yet. The auth ``/register`` and
-    ``/login`` endpoints are no longer placeholders (issue #3),
+    ``/login`` endpoints are no longer placeholders (issue #3);
+    the billing endpoints are no longer placeholders (issue #7),
     so they are excluded from this list."""
     app = create_app(Settings())
     client = TestClient(app)
@@ -186,7 +187,6 @@ def test_placeholder_routes_return_not_implemented() -> None:
         ("GET", "/v1/messages", 501),
         ("GET", "/v1/templates", 501),
         ("GET", "/v1/webhooks", 501),
-        ("GET", "/v1/billing/balance", 501),
     )
     for method, path, expected_status in cases:
         response = client.request(method, path)
