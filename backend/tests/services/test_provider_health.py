@@ -720,3 +720,200 @@ async def test_list_recent_routing_attempts_respects_pagination(
     # first row and returns the next two.
     has_more = (1 + len(items)) < total
     assert has_more is True
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch helpers (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The kill-switch is the operator's "desactivar / activar"
+# button on the admin dashboard. The functions tested
+# below are the only mutator / reader the rest of the
+# codebase should use; a future iteration (caching, audit
+# log, …) lands here without rippling through every
+# caller.
+
+
+async def test_get_inactive_provider_names_returns_empty_set_by_default(
+    async_session,
+) -> None:
+    """A fresh database has no :class:`ProviderConfig`
+    rows, so the helper returns the empty set rather
+    than ``None``. The contract is "set of disabled
+    names" so the routing layer can pass the result
+    straight to :func:`get_provider` without
+    re-checking the ``None`` case."""
+    inactive = await provider_health.get_inactive_provider_names(async_session)
+    assert inactive == set()
+
+
+async def test_get_inactive_provider_names_filters_by_active_flag(
+    async_session,
+) -> None:
+    """Two :class:`ProviderConfig` rows are seeded – one
+    active, one disabled. The helper returns the
+    disabled one's name only; the active row is
+    invisible to the kill-switch query."""
+    session = async_session
+    session.add_all(
+        [
+            ProviderConfig(
+                name="meta_whatsapp",
+                channel=Channel.WHATSAPP,
+                active=True,
+            ),
+            ProviderConfig(
+                name="twilio_whatsapp",
+                channel=Channel.WHATSAPP,
+                active=False,
+            ),
+        ]
+    )
+    await session.commit()
+
+    inactive = await provider_health.get_inactive_provider_names(session)
+    assert inactive == {"twilio_whatsapp"}
+
+
+async def test_set_provider_active_creates_row_when_missing(
+    async_session,
+) -> None:
+    """Toggling a never-seen provider auto-creates a
+    :class:`ProviderConfig` row so the operator's
+    "desactivar" button works even when the health
+    worker has not probed the provider yet. The new
+    row's :attr:`ProviderConfig.health_status` is
+    ``unknown`` (the conservative default) so the
+    dashboard never lies about the probe history."""
+    row = await provider_health.set_provider_active(
+        async_session,
+        name="twilio_whatsapp",
+        active=False,
+    )
+    await async_session.commit()
+    assert row.name == "twilio_whatsapp"
+    assert row.active is False
+    assert row.health_status == ProviderHealth.UNKNOWN
+
+
+async def test_set_provider_active_flips_existing_row(
+    async_session,
+) -> None:
+    """The mutator updates an existing row in place –
+    no duplicate rows, no spurious insert. The returned
+    object is the same instance the caller already
+    knew about (or can be re-fetched from the
+    session)."""
+    session = async_session
+    row = ProviderConfig(
+        name="meta_whatsapp",
+        channel=Channel.WHATSAPP,
+        active=True,
+    )
+    session.add(row)
+    await session.commit()
+
+    updated = await provider_health.set_provider_active(
+        session,
+        name="meta_whatsapp",
+        active=False,
+    )
+    await session.commit()
+
+    assert updated.id == row.id
+    assert updated.active is False
+
+
+async def test_set_provider_active_is_idempotent(
+    async_session,
+) -> None:
+    """Posting the same target state twice is a no-op
+    (the test asserts the row is not duplicated). The
+    idempotence keeps the operator's "re-click
+    desactivar" action cheap and the audit log
+    clean."""
+    await provider_health.set_provider_active(
+        async_session,
+        name="meta_whatsapp",
+        active=False,
+    )
+    await provider_health.set_provider_active(
+        async_session,
+        name="meta_whatsapp",
+        active=False,
+    )
+    await async_session.commit()
+
+    from sqlalchemy import func, select
+
+    count = await async_session.execute(
+        select(func.count(ProviderConfig.id)).where(
+            ProviderConfig.name == "meta_whatsapp"
+        )
+    )
+    assert int(count.scalar_one()) == 1
+
+
+async def test_set_provider_active_then_get_inactive_round_trip(
+    async_session,
+) -> None:
+    """The two helpers form a single round-trip: the
+    mutator flips the flag, the reader sees the
+    updated state on the next call. A test that
+    exercises both functions catches any drift
+    between the writer and the reader (e.g. a
+    forgotten ``flush`` in the mutator)."""
+    await provider_health.set_provider_active(
+        async_session,
+        name="twilio_whatsapp",
+        active=False,
+    )
+    await async_session.commit()
+    inactive = await provider_health.get_inactive_provider_names(async_session)
+    assert "twilio_whatsapp" in inactive
+
+    # Re-enable and confirm the reader follows.
+    await provider_health.set_provider_active(
+        async_session,
+        name="twilio_whatsapp",
+        active=True,
+    )
+    await async_session.commit()
+    inactive = await provider_health.get_inactive_provider_names(async_session)
+    assert "twilio_whatsapp" not in inactive
+
+
+async def test_set_provider_active_guess_channel_uses_sms_keyword(
+    async_session,
+) -> None:
+    """The auto-create path uses a *placeholder*
+    channel for a never-seen provider. The placeholder
+    is best-effort: a name that contains ``"sms"``
+    is mapped to :attr:`Channel.SMS` so the admin
+    dashboard renders the row with the right
+    channel badge. The health worker overwrites the
+    field on the first successful probe."""
+    row = await provider_health.set_provider_active(
+        async_session,
+        name="custom_sms_provider",
+        active=False,
+    )
+    await async_session.commit()
+    assert row.channel == Channel.SMS
+
+
+async def test_set_provider_active_guess_channel_defaults_to_whatsapp(
+    async_session,
+) -> None:
+    """A name that does not contain ``"sms"`` falls
+    back to :attr:`Channel.WHATSAPP` (the most common
+    channel in the MVP). The fallback keeps the row
+    in a known-good state until the health worker
+    refines the channel on the first probe."""
+    row = await provider_health.set_provider_active(
+        async_session,
+        name="twilio_whatsapp",
+        active=True,
+    )
+    await async_session.commit()
+    assert row.channel == Channel.WHATSAPP

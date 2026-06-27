@@ -311,3 +311,141 @@ def test_get_provider_rejects_unknown_channel_string(
     settings = _settings()
     with pytest.raises(UnsupportedChannelError):
         get_provider("telegram", settings=settings)
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The ``inactive`` set on :func:`get_provider` is the
+# operator's manual disable. The tests below pin the
+# contract between the dashboard ("desactivar" button) and
+# the routing layer: the chain the registry returns must
+# not include a disabled provider, and the synthetic
+# chain name must reflect the surviving members only.
+
+
+def test_get_provider_skips_inactive_primary(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A chain whose primary is in the kill-switch set
+    is re-headed: the next active member becomes the
+    new primary. The result is a single-provider
+    chain (no :class:`FailoverProvider` wrapper) so
+    the call site does not pay the failover overhead
+    for a chain with one survivor."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(
+        Channel.WHATSAPP,
+        settings=settings,
+        inactive={"meta_whatsapp"},
+    )
+    # Single survivor → registry unwraps the chain.
+    assert provider is stub_providers["twilio_whatsapp"]
+    assert provider.name == "twilio_whatsapp"
+
+
+def test_get_provider_filters_inactive_fallback(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A chain whose *fallback* is disabled is returned
+    as a single provider (the surviving primary). The
+    registry unwraps the chain when only one member
+    survives so the call site does not pay the
+    failover overhead for a chain of one."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    provider = get_provider(
+        Channel.WHATSAPP,
+        settings=settings,
+        inactive={"twilio_whatsapp"},
+    )
+    # Single survivor → registry unwraps the chain.
+    assert provider is stub_providers["meta_whatsapp"]
+    assert provider.name == "meta_whatsapp"
+
+
+def test_get_provider_filters_multiple_inactive(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """Several inactive names at once: the registry
+    filters *all* of them, preserving the order. A
+    future iteration that wants to skip a chain in
+    bulk (e.g. "disable the WhatsApp fleet for
+    maintenance") should be a single call to
+    :func:`get_provider` with a pre-populated set."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings(
+        whatsapp=["meta_whatsapp", "twilio_whatsapp"],
+        sms=["sms_aggregator", "twilio_sms"],
+    )
+    # All WhatsApp providers disabled: the registry
+    # must surface :class:`AllProvidersDisabledError`
+    # so the route layer can render a 503. The SMS
+    # chain is unaffected (separate channel).
+    with pytest.raises(AllProvidersDisabledError):
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp", "twilio_whatsapp"},
+        )
+
+
+def test_get_provider_raises_when_every_provider_disabled(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """Every member in the kill-switch set: the
+    registry raises :class:`AllProvidersDisabledError`
+    (a :class:`ProviderError` subclass) so the route
+    layer can surface a 503 with a stable error code
+    rather than silently returning an empty chain."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    with pytest.raises(AllProvidersDisabledError) as exc_info:
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp", "twilio_whatsapp"},
+        )
+    assert exc_info.value.channel == Channel.WHATSAPP
+    assert exc_info.value.http_status == 503
+    assert exc_info.value.code == "provider_disabled"
+
+
+def test_get_provider_raises_when_single_provider_disabled(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """A single-provider channel (no chain configured)
+    whose only provider is disabled is the same
+    edge case: :class:`AllProvidersDisabledError` so
+    the route layer can render a 503 with the same
+    error code the chain path uses."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = _settings()  # no chains
+    with pytest.raises(AllProvidersDisabledError) as exc_info:
+        get_provider(
+            Channel.WHATSAPP,
+            settings=settings,
+            inactive={"meta_whatsapp"},
+        )
+    assert exc_info.value.channel == Channel.WHATSAPP
+
+
+def test_get_provider_empty_inactive_set_keeps_pre_kill_switch_behaviour(
+    stub_providers: dict[str, _StubProvider],
+) -> None:
+    """``inactive=None`` and ``inactive=set()`` both
+    keep the pre-kill-switch behaviour bit-for-bit.
+    A deployment that has not opted into the
+    kill-switch (the common case for the MVP) does
+    not have to change its call site."""
+    settings = _settings(whatsapp=["meta_whatsapp", "twilio_whatsapp"])
+    chain_none = get_provider(Channel.WHATSAPP, settings=settings, inactive=None)
+    chain_empty = get_provider(
+        Channel.WHATSAPP, settings=settings, inactive=set()
+    )
+    assert isinstance(chain_none, FailoverProvider)
+    assert isinstance(chain_empty, FailoverProvider)
+    assert chain_none.providers() == chain_empty.providers()

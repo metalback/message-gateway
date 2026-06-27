@@ -397,3 +397,150 @@ async def test_send_message_uses_plain_provider_when_no_chain(
     provider = get_provider(Channel.WHATSAPP, settings=settings)
     assert not isinstance(provider, FailoverProvider)
     assert provider.name == "meta_whatsapp"
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The operator can disable a provider from the admin
+# dashboard. The tests below exercise the service's
+# wiring: a disabled primary never receives the call,
+# the chain the registry returns is rebuilt with the
+# surviving member as the new primary, and a fully-
+# disabled channel surfaces as :class:`AllProvidersDisabledError`
+# (a 503) with the row marked ``failed``.
+
+
+async def _seed_inactive_provider(
+    async_session,
+    *,
+    name: str,
+) -> None:
+    """Insert a :class:`ProviderConfig` row flagged ``active=False``.
+
+    The helper is the only thing the messaging tests need
+    to put the kill-switch in the right state – a fresh
+    in-memory session has no rows at all, so the
+    ``get_inactive_provider_names`` reader would return an
+    empty set.
+    """
+    from app.models.provider_config import ProviderConfig
+
+    async_session.add(
+        ProviderConfig(
+            name=name,
+            channel=Channel.WHATSAPP,
+            active=False,
+        )
+    )
+    await async_session.commit()
+
+
+async def test_send_message_skips_inactive_primary(
+    async_session,
+    failover_providers,
+    failover_settings,
+) -> None:
+    """A primary that the operator disabled is invisible
+    to the service. The chain the registry returns is
+    re-headed to the next active member, so the call
+    lands on the fallback without the primary ever
+    being asked."""
+    settings = Settings(
+        provider_failover_chains={"whatsapp": ["meta_whatsapp", "twilio_whatsapp"]},
+    )
+    await _seed_inactive_provider(async_session, name="meta_whatsapp")
+    failover_providers["twilio_whatsapp"]._responses = [
+        SendResult(provider_msg_id="tw-1", raw={}),
+    ]
+    client = await _make_client(async_session)
+    outcome = await send_message(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        to="+56912345678",
+        body="hola",
+        settings=settings,
+    )
+    assert outcome.message.status == MessageStatus.SENT
+    assert outcome.message.provider == "twilio_whatsapp"
+    # The primary never saw the call.
+    assert failover_providers["meta_whatsapp"].send_calls == []
+    assert len(failover_providers["twilio_whatsapp"].send_calls) == 1
+
+
+async def test_send_message_skips_inactive_fallback(
+    async_session,
+    failover_providers,
+    failover_settings,
+) -> None:
+    """A disabled *fallback* is filtered out of the chain
+    but the primary still receives the call. The test
+    pins the asymmetry: the operator's "desactivar"
+    button affects the listed member without
+    cascading to the rest of the chain."""
+    settings = Settings(
+        provider_failover_chains={"whatsapp": ["meta_whatsapp", "twilio_whatsapp"]},
+    )
+    await _seed_inactive_provider(async_session, name="twilio_whatsapp")
+    failover_providers["meta_whatsapp"]._responses = [
+        SendResult(provider_msg_id="meta-1", raw={}),
+    ]
+    client = await _make_client(async_session)
+    outcome = await send_message(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        to="+56912345678",
+        body="hola",
+        settings=settings,
+    )
+    assert outcome.message.status == MessageStatus.SENT
+    assert outcome.message.provider == "meta_whatsapp"
+    # The fallback never saw the call.
+    assert failover_providers["twilio_whatsapp"].send_calls == []
+
+
+async def test_send_message_marks_failed_when_every_provider_disabled(
+    async_session,
+    failover_providers,
+    failover_settings,
+) -> None:
+    """A chain whose every member is disabled raises
+    :class:`AllProvidersDisabledError` from the
+    registry. The service catches it, marks the row
+    ``failed`` with a stable error code, and re-raises
+    so the route layer can surface a 503."""
+    from app.adapters.registry import AllProvidersDisabledError
+
+    settings = Settings(
+        provider_failover_chains={"whatsapp": ["meta_whatsapp", "twilio_whatsapp"]},
+    )
+    await _seed_inactive_provider(async_session, name="meta_whatsapp")
+    await _seed_inactive_provider(async_session, name="twilio_whatsapp")
+    client = await _make_client(async_session)
+    with pytest.raises(AllProvidersDisabledError) as exc_info:
+        await send_message(
+            async_session,
+            client=client,
+            channel=Channel.WHATSAPP,
+            to="+56912345678",
+            body="hola",
+            settings=settings,
+        )
+    assert exc_info.value.code == "provider_disabled"
+    assert exc_info.value.http_status == 503
+    # The row is durable: the service committed before
+    # the registry raised, so a polling dashboard sees
+    # the failure rather than a stuck "pending" entry.
+    await async_session.refresh(client)
+    # Reload the latest message from the session.
+    from sqlalchemy import select
+
+    from app.models.message import Message
+
+    stmt = select(Message).order_by(Message.created_at.desc())
+    last = (await async_session.execute(stmt)).scalar_one()
+    assert last.status == MessageStatus.FAILED
+    assert last.error_code == "provider_disabled"

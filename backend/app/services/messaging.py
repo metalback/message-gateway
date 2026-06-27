@@ -91,7 +91,7 @@ from sqlalchemy.sql import ColumnElement
 from app.adapters.base import SendResult
 from app.adapters.errors import ProviderError
 from app.adapters.failover import FailoverProvider
-from app.adapters.registry import get_provider
+from app.adapters.registry import AllProvidersDisabledError, get_provider
 from app.config import Settings, get_settings
 from app.models.batch import Batch, BatchStatus
 from app.models.client import Client, ClientPlan
@@ -729,7 +729,33 @@ async def send_message(
     await session.commit()
     await session.refresh(message)
 
-    provider = get_provider(channel, settings=cfg)
+    # Issue #11 (kill-switch): the operator can disable a
+    # provider from the admin dashboard. The
+    # :func:`app.services.provider_health.get_inactive_provider_names`
+    # helper returns the live set; we feed it to
+    # :func:`get_provider` so the chain the messaging
+    # service walks contains only enabled upstreams. The
+    # lookup is a single indexed read on a handful of
+    # rows – the cost is dwarfed by the HTTP call that
+    # follows.
+    from app.services.provider_health import get_inactive_provider_names
+
+    inactive = await get_inactive_provider_names(session)
+    try:
+        provider = get_provider(channel, settings=cfg, inactive=inactive)
+    except AllProvidersDisabledError as exc:
+        # The kill-switch is on for every provider in the
+        # chain – the message has nowhere to go. Mark it
+        # ``failed`` so the customer sees a definitive
+        # outcome (rather than a row that stays in
+        # ``pending`` forever) and re-raise so the route
+        # layer can surface the 503.
+        message.status = MessageStatus.FAILED
+        message.error_code = exc.code
+        message.error_message = exc.message[:500]
+        await session.commit()
+        await session.refresh(message)
+        raise
     # Issue #11: wire the per-attempt recorder into the
     # failover router so every provider attempt the
     # chain walks lands as a row in ``routing_log``.

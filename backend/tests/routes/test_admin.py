@@ -823,3 +823,356 @@ def admin_headers_default_limit() -> int:
     from app.services import admin as admin_service
 
     return admin_service.DEFAULT_LIST_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/admin/providers/{name}/active (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The endpoint is the operator's "desactivar / activar"
+# button on the admin dashboard. The tests below pin the
+# observable HTTP contract: status code, response body
+# shape, idempotence and the admin-only authorisation
+# guard.
+
+
+def test_set_provider_active_disables_existing_provider(
+    client, admin_headers
+) -> None:
+    """Posting ``{"active": false}`` flips a previously
+    enabled provider to disabled and returns the
+    post-update snapshot. The dashboard uses the
+    response to refresh the row in place without
+    re-issuing the ``GET /v1/admin/providers/health``
+    call."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=True,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/active",
+        json={"active": False},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "meta_whatsapp"
+    assert body["active"] is False
+
+
+def test_set_provider_active_re_enables_provider(client, admin_headers) -> None:
+    """Posting ``{"active": true}`` on a previously
+    disabled provider flips the flag back. The round-
+    trip pins the contract that a disabled provider
+    can always be re-enabled through the same
+    endpoint (no separate "re-enable" route)."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=False,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/active",
+        json={"active": True},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "meta_whatsapp"
+    assert body["active"] is True
+
+
+def test_set_provider_active_auto_creates_row_when_missing(
+    client, admin_headers
+) -> None:
+    """A provider that has never been probed (no
+    :class:`ProviderConfig` row) is auto-created on
+    the first toggle so the operator does not have
+    to race the health worker. The dashboard sees a
+    fresh row with ``health_status="unknown"`` and
+    the requested target state."""
+    response = client.post(
+        "/v1/admin/providers/twilio_whatsapp/active",
+        json={"active": False},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "twilio_whatsapp"
+    assert body["active"] is False
+    assert body["health_status"] == "unknown"
+
+
+def test_set_provider_active_rejects_non_admin(
+    client, regular_headers
+) -> None:
+    """A regular customer gets the standard 403 –
+    only admins can flip the kill-switch. The test
+    pins the authorisation guard so a future
+    refactor does not accidentally leak the
+    endpoint to a non-admin."""
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/active",
+        json={"active": False},
+        headers=regular_headers,
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "admin_required"
+
+
+def test_set_provider_active_rejects_missing_body_field(
+    client, admin_headers
+) -> None:
+    """A body without the ``active`` key is a 422 –
+    the helper does not have to guess whether the
+    operator meant "turn it on" or "leave it alone"."""
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/active",
+        json={},
+        headers=admin_headers,
+    )
+    assert response.status_code == 422
+
+
+def test_set_provider_active_is_idempotent(client, admin_headers) -> None:
+    """Posting the same target state twice is a no-op:
+    the response shape is identical, the database
+    holds exactly one row for the provider, and no
+    duplicate is created. The idempotence keeps the
+    operator's "re-click" actions cheap."""
+    import asyncio
+
+    from sqlalchemy import func, select
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=True,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    for _ in range(2):
+        response = client.post(
+            "/v1/admin/providers/meta_whatsapp/active",
+            json={"active": False},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["active"] is False
+
+    # Exactly one row in the table for the provider.
+    async def _count() -> int:
+        async with factory() as session:
+            return int(
+                (
+                    await session.execute(
+                        select(func.count(ProviderConfig.id)).where(
+                            ProviderConfig.name == "meta_whatsapp"
+                        )
+                    )
+                ).scalar_one()
+            )
+
+    assert asyncio.run(_count()) == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/admin/providers/{name}/toggle (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The toggle endpoint is the dashboard's "switch" button:
+# it reads the current state and POSTs the opposite. The
+# tests below pin the read-then-write contract and the
+# same authorisation / idempotence guarantees the
+# target-state endpoint provides.
+
+
+def test_toggle_provider_flips_inactive_to_active(client, admin_headers) -> None:
+    """A provider that starts as ``active=False`` is
+    flipped to ``active=True`` after a single POST.
+    The response carries the post-update snapshot
+    so the dashboard can refresh the row in place."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=False,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/toggle",
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "meta_whatsapp"
+    assert body["active"] is True
+
+
+def test_toggle_provider_flips_active_to_inactive(client, admin_headers) -> None:
+    """A provider that starts as ``active=True`` is
+    flipped to ``active=False`` after a single POST.
+    The asymmetry with the previous test pins the
+    read-then-write contract: the helper reads the
+    current value and POSTs the opposite, regardless
+    of which direction the operator starts from."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=True,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/toggle",
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "meta_whatsapp"
+    assert body["active"] is False
+
+
+def test_toggle_provider_auto_creates_row_when_missing(client, admin_headers) -> None:
+    """A never-seen provider is auto-created in the
+    *disabled* state on the first toggle (the
+    read-then-write helper sees no row and
+    treats "no row" as "currently active"). The
+    dashboard can then re-toggle to enable the
+    provider without further setup."""
+    response = client.post(
+        "/v1/admin/providers/twilio_whatsapp/toggle",
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "twilio_whatsapp"
+    assert body["active"] is False
+
+
+def test_toggle_provider_rejects_non_admin(client, regular_headers) -> None:
+    """The toggle endpoint shares the admin-only
+    authorisation guard. A regular customer gets
+    a 403 with the standard ``admin_required``
+    code."""
+    response = client.post(
+        "/v1/admin/providers/meta_whatsapp/toggle",
+        headers=regular_headers,
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "admin_required"
+
+
+def test_set_provider_active_response_shape_matches_health_endpoint(
+    client, admin_headers
+) -> None:
+    """The kill-switch response is the same
+    :class:`ProviderHealthResponse` shape the
+    health endpoint returns. A test that
+    exercises both endpoints and asserts the
+    keys are equal pins the contract so the
+    dashboard can render the row with a single
+    component."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add(
+                ProviderConfig(
+                    name="meta_whatsapp",
+                    channel=Channel.WHATSAPP,
+                    active=True,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    health = client.get(
+        "/v1/admin/providers/health", headers=admin_headers
+    ).json()
+    toggled = client.post(
+        "/v1/admin/providers/meta_whatsapp/active",
+        json={"active": True},
+        headers=admin_headers,
+    ).json()
+    assert set(toggled.keys()) == set(health[0].keys())

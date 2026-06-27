@@ -53,6 +53,7 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -776,4 +777,159 @@ async def admin_routing_log_endpoint(
         limit=min(limit, provider_health.DEFAULT_ROUTING_LOG_LIMIT * 5),
         offset=offset,
         has_more=has_more,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The ``active`` column on :class:`ProviderConfig` is the
+# operator's manual kill-switch. The two endpoints below
+# are the only surface the dashboard uses to flip it:
+#
+# - ``POST /v1/admin/providers/{name}/active`` with
+#   ``{"active": true|false}`` sets the target state.
+#   Idempotent: POSTing the same value twice is a no-op
+#   and returns the same row.
+# - ``POST /v1/admin/providers/{name}/toggle`` flips the
+#   current value, which is the "desactivar" button on
+#   the dashboard. The route is a thin wrapper over
+#   the target-state endpoint so the test surface stays
+#   small.
+#
+# Both endpoints reuse :class:`ProviderHealthResponse` so
+# the dashboard can refresh the row in place without
+# re-issuing the ``GET /v1/admin/providers/health`` call.
+
+
+class SetProviderActiveRequest(BaseModel):
+    """Body of ``POST /v1/admin/providers/{name}/active``.
+
+    ``active`` is the *target* state of the kill-switch
+    (the operator's "desactivar" / "activar" button on
+    the dashboard). A missing key is a 422 – the helper
+    does not have to guess whether the operator meant
+    "turn it on" or "leave it alone".
+    """
+
+    active: bool = Field(
+        ...,
+        description="Target state of the kill-switch (true = enabled, false = disabled).",
+    )
+
+
+@router.post(
+    "/providers/{provider_name}/active",
+    response_model=ProviderHealthResponse,
+    responses={
+        200: {"description": "Kill-switch updated; row is the post-update snapshot."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        403: {"description": "The caller is not an admin."},
+        422: {"description": "The request body is malformed."},
+    },
+)
+async def admin_set_provider_active_endpoint(
+    provider_name: str,
+    payload: SetProviderActiveRequest,
+    _admin: Client = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> ProviderHealthResponse:
+    """Set the kill-switch for ``provider_name`` (issue #11).
+
+    The endpoint is the operator's escape hatch during a
+    live incident: flipping a provider to ``active=false``
+    immediately stops the routing layer from sending new
+    traffic to it, while a future re-enable (``active=true``)
+    restores the chain on the very next request. The
+    response is the same :class:`ProviderHealthResponse`
+    the dashboard already renders, so a successful call
+    refreshes the row in place.
+    """
+    if not provider_name or not provider_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "invalid_provider_name",
+                "message": "provider name is required",
+            },
+        )
+    row = await provider_health.set_provider_active(
+        session,
+        name=provider_name,
+        active=payload.active,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return ProviderHealthResponse(
+        name=row.name,
+        channel=str(row.channel),
+        health_status=str(row.health_status),
+        last_health_check=row.last_health_check,
+        last_latency_ms=row.last_latency_ms,
+        consecutive_failures=row.consecutive_failures,
+        consecutive_successes=row.consecutive_successes,
+        active=row.active,
+        priority=row.priority,
+    )
+
+
+@router.post(
+    "/providers/{provider_name}/toggle",
+    response_model=ProviderHealthResponse,
+    responses={
+        200: {"description": "Kill-switch flipped; row is the post-update snapshot."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        403: {"description": "The caller is not an admin."},
+        422: {"description": "The provider name is missing."},
+    },
+)
+async def admin_toggle_provider_endpoint(
+    provider_name: str,
+    _admin: Client = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> ProviderHealthResponse:
+    """Flip the kill-switch for ``provider_name`` (issue #11).
+
+    Convenience wrapper over
+    :func:`admin_set_provider_active_endpoint` that reads
+    the current value and POSTs the opposite. The route
+    is the "desactivar / activar" toggle button on the
+    admin dashboard; tests use the target-state endpoint
+    to avoid the read-then-write race the toggle path
+    would otherwise introduce.
+    """
+    if not provider_name or not provider_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "invalid_provider_name",
+                "message": "provider name is required",
+            },
+        )
+    # Read the current state. A missing row is treated as
+    # "currently active" so the toggle path auto-creates
+    # the row in the disabled state on first use.
+    from app.models.provider_config import ProviderConfig
+
+    stmt = select(ProviderConfig).where(ProviderConfig.name == provider_name)
+    current = (await session.execute(stmt)).scalar_one_or_none()
+    next_state = not bool(current.active) if current is not None else False
+    row = await provider_health.set_provider_active(
+        session,
+        name=provider_name,
+        active=next_state,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return ProviderHealthResponse(
+        name=row.name,
+        channel=str(row.channel),
+        health_status=str(row.health_status),
+        last_health_check=row.last_health_check,
+        last_latency_ms=row.last_latency_ms,
+        consecutive_failures=row.consecutive_failures,
+        consecutive_successes=row.consecutive_successes,
+        active=row.active,
+        priority=row.priority,
     )

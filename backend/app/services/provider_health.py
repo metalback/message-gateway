@@ -721,6 +721,110 @@ async def list_recent_routing_attempts(
     return rows, total
 
 
+# ---------------------------------------------------------------------------
+# Kill-switch (issue #11)
+# ---------------------------------------------------------------------------
+#
+# The :attr:`ProviderConfig.active` column is the operator's
+# manual kill-switch. Flipping it to ``False`` must
+# (1) skip the row in the routing layer, and
+# (2) stay visible on the admin dashboard so the operator
+#     can flip it back on without re-creating the row.
+#
+# The functions below are the only mutators / readers of
+# the field the rest of the codebase is expected to use.
+# They are intentionally small so a future change
+# (caching, audit log, …) does not ripple through every
+# call site.
+
+
+async def get_inactive_provider_names(session: AsyncSession) -> set[str]:
+    """Return the set of provider names the operator has disabled.
+
+    A single indexed ``SELECT name FROM provider_config
+    WHERE active = false`` is enough: the result is small
+    (the platform has a handful of providers at most) and
+    the call site only needs the names, not the rows. The
+    function is the single source of truth for the
+    kill-switch so a future iteration (a Redis cache, an
+    in-process LRU, …) does not have to chase down every
+    consumer of the field.
+    """
+    stmt = select(ProviderConfig.name).where(ProviderConfig.active.is_(False))
+    result = await session.execute(stmt)
+    return {name for name in result.scalars().all()}
+
+
+async def set_provider_active(
+    session: AsyncSession,
+    *,
+    name: str,
+    active: bool,
+) -> ProviderConfig:
+    """Flip the kill-switch for ``name`` and return the updated row.
+
+    The function is the only mutator the rest of the
+    codebase should use – the route layer hands the
+    request through to this helper so the
+    "no row found" path is uniform (a 404 from the API
+    edge) and the audit trail is in one place.
+
+    A brand-new provider that has never been probed yet
+    (no :class:`ProviderConfig` row) is auto-created on
+    the first toggle so the operator does not have to
+    race the health worker to flip a kill-switch. The
+    created row defaults to :attr:`ProviderHealth.UNKNOWN`
+    so the dashboard never lies about the probe history.
+
+    ``active`` is the *target* state, not a flip:
+    callers that want a "toggle" button read the
+    current value first and pass the opposite. This
+    makes the helper idempotent (POSTing the same value
+    twice is a no-op) and keeps the test surface free
+    of "did the value flip?" ambiguity.
+    """
+    stmt = select(ProviderConfig).where(ProviderConfig.name == name)
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        # A missing row means the platform has not yet
+        # probed the provider. Auto-create with a
+        # ``health_status=unknown`` so the dashboard
+        # can render the kill-switch without waiting
+        # for the worker to catch up.
+        row = ProviderConfig(
+            name=name,
+            channel=_guess_channel_for_provider(name),
+            priority=0,
+            health_status=ProviderHealth.UNKNOWN,
+        )
+        session.add(row)
+        await session.flush()
+    row.active = bool(active)
+    await session.flush()
+    return row
+
+
+def _guess_channel_for_provider(name: str) -> Channel:
+    """Best-effort channel guess for a never-seen provider.
+
+    The :class:`ProviderConfig` row is the *runtime*
+    health snapshot, not a configuration source, so the
+    channel the auto-created row carries is a
+    *placeholder* the health worker can refine on the
+    next probe. The mapping below mirrors the
+    ``BaseProvider.name`` values the platform actually
+    ships; an unknown name falls back to
+    :attr:`Channel.WHATSAPP` (the most common channel
+    in the MVP) so the row is created in a known-good
+    state. The health worker will overwrite the field
+    on the first successful probe.
+    """
+    lowered = (name or "").lower()
+    if "sms" in lowered:
+        return Channel.SMS
+    return Channel.WHATSAPP
+
+
 __all__ = (
     "DEFAULT_ROUTING_LOG_LIMIT",
     "HEALTHCHECK_PROVIDER_MSG_ID",
@@ -729,9 +833,11 @@ __all__ = (
     "ProviderHealthRow",
     "RoutingAttemptRow",
     "build_attempt_recorder",
+    "get_inactive_provider_names",
     "list_provider_health",
     "list_recent_routing_attempts",
     "probe_provider",
     "record_routing_attempt",
     "run_health_checks",
+    "set_provider_active",
 )
