@@ -178,12 +178,12 @@ def test_placeholder_routes_return_not_implemented() -> None:
     ``501 Not Implemented`` so the contract is explicit: the path
     exists, the feature doesn't yet. The auth ``/register`` and
     ``/login`` endpoints are no longer placeholders (issue #3),
-    so they are excluded from this list."""
+    and the message-sending endpoints are no longer placeholders
+    (issue #4), so they are excluded from this list."""
     app = create_app(Settings())
     client = TestClient(app)
 
     cases = (
-        ("GET", "/v1/messages", 501),
         ("GET", "/v1/templates", 501),
         ("GET", "/v1/webhooks", 501),
         ("GET", "/v1/billing/balance", 501),
@@ -210,5 +210,31 @@ def test_auth_register_endpoint_is_implemented() -> None:
     response = client.post("/v1/auth/register", json={})
     assert response.status_code != 501, (
         "POST /v1/auth/register must be implemented (issue #3), "
+        "not the scaffold 501 placeholder"
+    )
+
+
+def test_messages_send_endpoint_is_implemented() -> None:
+    """``POST /v1/messages`` was a placeholder until issue #4
+    landed; the test guards against a regression that would
+    re-introduce the 501 behaviour now that the endpoint is
+    real.
+
+    The request is intentionally missing a valid API key, so
+    the dependency short-circuits with a 401 (not a 501). The
+    assertion is the *not-501* half of the contract: as long
+    as the endpoint behaves like a real handler (it consults
+    the API-key dependency instead of stubbing the
+    response), the placeholder contract is dead.
+    """
+    app = create_app(Settings())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/messages",
+        json={"channel": "sms", "to": "+56912345678", "body": "hola"},
+    )
+    assert response.status_code != 501, (
+        "POST /v1/messages must be implemented (issue #4), "
         "not the scaffold 501 placeholder"
     )

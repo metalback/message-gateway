@@ -10,4 +10,39 @@ Adding a new provider is a three-step change:
 1. Implement :class:`BaseProvider` in a new module.
 2. Register it in ``app.adapters.registry``.
 3. Reference it from configuration (``Settings``).
+
+Modules in this package:
+
+- ``base.py``             – the abstract :class:`BaseProvider` and
+                            the :class:`SendResult` dataclass.
+- ``errors.py``           – provider-specific exception types
+                            (unavailable, validation, rate limit).
+- ``meta_whatsapp.py``    – Meta Cloud API adapter (WhatsApp).
+- ``sms_aggregator.py``   – local Chilean SMS aggregator.
+- ``registry.py``         – channel → adapter factory mapping.
 """
+
+from app.adapters.base import BaseProvider, SendResult
+from app.adapters.errors import (
+    ProviderError,
+    ProviderRateLimitError,
+    ProviderUnavailableError,
+    ProviderValidationError,
+)
+from app.adapters.registry import (
+    UnsupportedChannelError,
+    get_provider,
+    supported_channels,
+)
+
+__all__ = (
+    "BaseProvider",
+    "ProviderError",
+    "ProviderRateLimitError",
+    "ProviderUnavailableError",
+    "ProviderValidationError",
+    "SendResult",
+    "UnsupportedChannelError",
+    "get_provider",
+    "supported_channels",
+)

@@ -238,6 +238,15 @@ EXPECTED_ENV_KEYS: set[str] = {
     "JWT_ALGORITHM",
     "JWT_TTL_MINUTES",
     "API_KEY_PREFIX",
+    # Provider integration settings (issue #4).
+    "META_WHATSAPP_ACCESS_TOKEN",
+    "META_WHATSAPP_PHONE_NUMBER_ID",
+    "META_WHATSAPP_API_BASE",
+    "META_WHATSAPP_API_VERSION",
+    "SMS_AGGREGATOR_API_URL",
+    "SMS_AGGREGATOR_API_KEY",
+    "SMS_AGGREGATOR_SENDER_ID",
+    "PROVIDER_TIMEOUT_SECONDS",
     # Compose project name is consumed by docker-compose itself.
     "COMPOSE_PROJECT_NAME",
     # API_BASE_URL is consumed by the Angular build at image build time.
