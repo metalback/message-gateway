@@ -620,6 +620,195 @@ def test_admin_logs_pagination(client, admin_headers) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/admin/providers/health
+# ---------------------------------------------------------------------------
+
+
+def test_admin_providers_health_returns_empty_list_for_no_rows(
+    client, admin_headers
+) -> None:
+    """A fresh deployment with no provider health
+    snapshots returns an empty list – the dashboard
+    renders "no data yet" until the periodic worker
+    has had a chance to probe at least one upstream.
+    The endpoint is admin-only and surfaces the
+    empty state explicitly rather than 404-ing."""
+    response = client.get(
+        "/v1/admin/providers/health", headers=admin_headers
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_admin_providers_health_returns_seeded_rows(
+    client, admin_headers
+) -> None:
+    """After seeding two :class:`ProviderConfig` rows
+    the endpoint returns both, sorted by
+    ``(channel, priority, name)`` so the dashboard
+    renders the providers in routing order. The test
+    pins the column-projection contract: every
+    field the admin dashboard needs is present in
+    the response, no extra columns leak."""
+    import asyncio
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.provider_config import ProviderConfig, ProviderHealth
+
+    factory = db_module.get_session_factory()
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add_all(
+                [
+                    ProviderConfig(
+                        name="meta_whatsapp",
+                        channel=Channel.WHATSAPP,
+                        priority=0,
+                        health_status=ProviderHealth.HEALTHY,
+                        last_latency_ms=120,
+                    ),
+                    ProviderConfig(
+                        name="sms_aggregator",
+                        channel=Channel.SMS,
+                        priority=0,
+                        health_status=ProviderHealth.DEGRADED,
+                        last_latency_ms=350,
+                    ),
+                ]
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.get(
+        "/v1/admin/providers/health", headers=admin_headers
+    )
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 2
+    # SMS sorts before WhatsApp alphabetically; the
+    # two WhatsApp-style providers at priority 0
+    # would tiebreak by name (only one here).
+    assert rows[0]["channel"] == "sms"
+    assert rows[1]["channel"] == "whatsapp"
+    for row in rows:
+        assert set(row.keys()) == {
+            "name",
+            "channel",
+            "health_status",
+            "last_health_check",
+            "last_latency_ms",
+            "consecutive_failures",
+            "consecutive_successes",
+            "active",
+            "priority",
+        }
+
+
+def test_admin_providers_health_rejects_non_admin(
+    client, regular_headers
+) -> None:
+    """A non-admin caller gets the standard 403 – the
+    endpoint does not leak provider health to a
+    regular customer."""
+    response = client.get(
+        "/v1/admin/providers/health", headers=regular_headers
+    )
+    assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/providers/routing-log
+# ---------------------------------------------------------------------------
+
+
+def test_admin_routing_log_returns_empty_list_for_no_rows(
+    client, admin_headers
+) -> None:
+    """A fresh deployment with no audit history returns
+    an empty list (not 404). The dashboard treats the
+    empty state as "the worker has not logged anything
+    yet" rather than an error."""
+    response = client.get(
+        "/v1/admin/providers/routing-log", headers=admin_headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == []
+    assert body["total"] == 0
+    assert body["has_more"] is False
+
+
+def test_admin_routing_log_filters_by_message_id(
+    client, admin_headers
+) -> None:
+    """The optional ``message_id`` query parameter is
+    the per-message trace view: only the attempts the
+    chain made for a single message come back. The
+    test seeds two :class:`RoutingLog` rows for one
+    message and one for another, then asserts the
+    filter narrows the response to the right subset."""
+    import asyncio
+    import uuid
+
+    import app.db as db_module
+    from app.models.message import Channel
+    from app.models.routing_log import RoutingLog, RoutingLogOutcome
+
+    factory = db_module.get_session_factory()
+    target = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+
+    async def _seed() -> None:
+        async with factory() as session:
+            session.add_all(
+                [
+                    RoutingLog(
+                        message_id=target,
+                        provider_attempted="meta_whatsapp",
+                        channel=Channel.WHATSAPP,
+                        outcome=RoutingLogOutcome.FAILURE,
+                        latency_ms=10,
+                        error_code="provider_unavailable",
+                        error_message="meta 5xx",
+                    ),
+                    RoutingLog(
+                        message_id=target,
+                        provider_attempted="twilio_whatsapp",
+                        channel=Channel.WHATSAPP,
+                        outcome=RoutingLogOutcome.SUCCESS,
+                        latency_ms=15,
+                    ),
+                    RoutingLog(
+                        message_id=other,
+                        provider_attempted="sms_aggregator",
+                        channel=Channel.SMS,
+                        outcome=RoutingLogOutcome.SUCCESS,
+                        latency_ms=8,
+                    ),
+                ]
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+    response = client.get(
+        "/v1/admin/providers/routing-log",
+        params={"message_id": target},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    providers = {item["provider"] for item in body["items"]}
+    assert providers == {"meta_whatsapp", "twilio_whatsapp"}
+    for item in body["items"]:
+        assert item["message_id"] == target
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

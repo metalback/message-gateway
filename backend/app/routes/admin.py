@@ -22,6 +22,18 @@ dashboard consumes:
   counters for the overview card.
 - ``GET  /v1/admin/stats/by-provider``      – per-provider
   breakdown for the "desglose por proveedor" card.
+- ``GET  /v1/admin/providers/health``       – live health
+  snapshot for every provider the platform knows about
+  (the green / yellow / red traffic-light card – issue
+  #11).
+- ``POST /v1/admin/providers/health/check`` – force a
+  health probe across every provider and return the
+  resulting snapshot. The button on the admin dashboard
+  is the operator's escape hatch during a live incident.
+- ``GET  /v1/admin/providers/routing-log``  – paginated
+  read of the most recent ``routing_log`` rows (issue
+  #11), with an optional ``message_id`` filter for the
+  per-message trace view.
 - ``GET  /v1/admin/logs``                   – paginated
   read of the most recent failed messages.
 
@@ -45,8 +57,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.models.client import Client, ClientPlan, ClientRole, ClientStatus
+from app.models.message import Channel
 from app.routes.auth import require_api_key
 from app.services import admin as admin_service
+from app.services import provider_health
 from app.services.admin import (
     AdminError,
     AdminOverview,
@@ -575,6 +589,191 @@ async def admin_logs_endpoint(
         ],
         total=total,
         limit=min(limit, admin_service.DEFAULT_ERROR_LOG_LIMIT * 5),
+        offset=offset,
+        has_more=has_more,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider health (issue #11)
+# ---------------------------------------------------------------------------
+
+
+class ProviderHealthResponse(BaseModel):
+    """Projection of a :class:`provider_health.ProviderHealthRow` for the API.
+
+    The shape mirrors the read-API dataclass
+    :class:`~app.services.provider_health.ProviderHealthRow`
+    field-for-field so a future iteration that adds
+    columns to ``provider_config`` only has to extend
+    the dataclass – the Pydantic model is auto-derived
+    from it.
+    """
+
+    name: str
+    channel: str
+    health_status: str
+    last_health_check: datetime | None
+    last_latency_ms: int | None
+    consecutive_failures: int
+    consecutive_successes: int
+    active: bool
+    priority: int
+
+
+class RoutingAttemptResponse(BaseModel):
+    """Projection of a :class:`provider_health.RoutingAttemptRow` for the API."""
+
+    id: str
+    message_id: str | None
+    provider: str
+    channel: str
+    outcome: str
+    latency_ms: int
+    error_code: str | None
+    error_message: str | None
+    attempted_at: datetime
+
+
+class RoutingAttemptListResponse(BaseModel):
+    """Envelope for the ``GET /v1/admin/providers/routing-log`` response."""
+
+    items: list[RoutingAttemptResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
+@router.get(
+    "/providers/health",
+    response_model=list[ProviderHealthResponse],
+    responses={
+        200: {"description": "Live health snapshot for every provider."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        403: {"description": "The caller is not an admin."},
+    },
+)
+async def admin_providers_health_endpoint(
+    channel: Channel | None = Query(default=None),
+    _admin: Client = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> list[ProviderHealthResponse]:
+    """Return the live health snapshot for every provider (issue #11).
+
+    The optional ``channel`` query parameter lets the
+    dashboard render a per-channel health card without
+    having to filter on the client side. The response
+    is sorted by ``(channel, priority, name)`` so the
+    cards line up with the routing order the
+    :class:`~app.adapters.registry` will use.
+    """
+    rows = await provider_health.list_provider_health(session, channel=channel)
+    return [
+        ProviderHealthResponse(
+            name=row.name,
+            channel=row.channel,
+            health_status=row.health_status,
+            last_health_check=row.last_health_check,
+            last_latency_ms=row.last_latency_ms,
+            consecutive_failures=row.consecutive_failures,
+            consecutive_successes=row.consecutive_successes,
+            active=row.active,
+            priority=row.priority,
+        )
+        for row in rows
+    ]
+
+
+@router.post(
+    "/providers/health/check",
+    response_model=list[ProviderHealthResponse],
+    responses={
+        200: {"description": "Fresh snapshot after running the probes."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        403: {"description": "The caller is not an admin."},
+    },
+)
+async def admin_providers_health_check_endpoint(
+    _admin: Client = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> list[ProviderHealthResponse]:
+    """Force a health probe across every provider (issue #11).
+
+    The endpoint is the "ejecutar ahora" button on the
+    admin dashboard. It runs the same probe the periodic
+    worker runs (see
+    :func:`app.services.provider_health.run_health_checks`)
+    and returns the resulting snapshot so the dashboard
+    can refresh without polling.
+    """
+    await provider_health.run_health_checks(session)
+    rows = await provider_health.list_provider_health(session)
+    return [
+        ProviderHealthResponse(
+            name=row.name,
+            channel=row.channel,
+            health_status=row.health_status,
+            last_health_check=row.last_health_check,
+            last_latency_ms=row.last_latency_ms,
+            consecutive_failures=row.consecutive_failures,
+            consecutive_successes=row.consecutive_successes,
+            active=row.active,
+            priority=row.priority,
+        )
+        for row in rows
+    ]
+
+
+@router.get(
+    "/providers/routing-log",
+    response_model=RoutingAttemptListResponse,
+    responses={
+        200: {"description": "Most recent routing_log rows, newest first."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        403: {"description": "The caller is not an admin."},
+    },
+)
+async def admin_routing_log_endpoint(
+    limit: int = Query(default=provider_health.DEFAULT_ROUTING_LOG_LIMIT, ge=1),
+    offset: int = Query(default=0, ge=0),
+    message_id: str | None = Query(default=None),
+    _admin: Client = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+) -> RoutingAttemptListResponse:
+    """Return the most recent :class:`routing_log` rows (issue #11).
+
+    The optional ``message_id`` filter is the per-message
+    trace view: pass a message id and the response
+    contains only the attempts the chain made for that
+    message. The default ordering is
+    ``attempted_at`` descending so the most recent
+    attempt is at the top of the dashboard list.
+    """
+    items, total = await provider_health.list_recent_routing_attempts(
+        session,
+        message_id=message_id,
+        limit=limit,
+        offset=offset,
+    )
+    has_more = (offset + len(items)) < total
+    return RoutingAttemptListResponse(
+        items=[
+            RoutingAttemptResponse(
+                id=row.id,
+                message_id=row.message_id,
+                provider=row.provider,
+                channel=row.channel,
+                outcome=row.outcome,
+                latency_ms=row.latency_ms,
+                error_code=row.error_code,
+                error_message=row.error_message,
+                attempted_at=row.attempted_at,
+            )
+            for row in items
+        ],
+        total=total,
+        limit=min(limit, provider_health.DEFAULT_ROUTING_LOG_LIMIT * 5),
         offset=offset,
         has_more=has_more,
     )

@@ -23,6 +23,8 @@ from app.models.invoice import Invoice, InvoiceStatus, InvoiceType
 from app.models.message import BILLABLE_STATUSES, Channel, Message, MessageStatus
 from app.models.payment import Payment, PaymentStatus
 from app.models.plan import Plan, PlanBillingPeriod
+from app.models.provider_config import ProviderConfig, ProviderHealth
+from app.models.routing_log import RoutingLog, RoutingLogOutcome
 from app.models.webhook import DEFAULT_EVENTS, Webhook, WebhookEvent
 from app.models.whatsapp_template import (
     WhatsAppTemplate,
@@ -50,6 +52,10 @@ __all__ = (
     "PaymentStatus",
     "Plan",
     "PlanBillingPeriod",
+    "ProviderConfig",
+    "ProviderHealth",
+    "RoutingLog",
+    "RoutingLogOutcome",
     "Webhook",
     "WebhookEvent",
     "WhatsAppTemplate",

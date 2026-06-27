@@ -8,9 +8,10 @@ override the values via `monkeypatch.setenv` or by constructing a
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -105,12 +106,68 @@ class Settings(BaseSettings):
 
     # Default timeout (in seconds) applied to every provider HTTP
     # call. Kept low so a misconfigured upstream fails the request
-    # fast instead of stalling on a TCP handshake. The Meta Cloud
-    # API recommends a ceiling around 10 seconds; the same value
-    # works for the SMS aggregator.
+    # fast instead of stalling on a TCP handshake. The Meta Cloud API
+    # recommends a ceiling around 10 seconds; the same value works for
+    # the SMS aggregator.
     provider_timeout_seconds: float = Field(
         default=10.0, alias="PROVIDER_TIMEOUT_SECONDS", ge=1.0, le=60.0
     )
+
+    # --- Provider failover chains (issue #11) ---------------------------
+    # JSON-encoded map of ``channel -> ordered provider chain``. The
+    # chain's first entry is treated as the primary provider; the
+    # remaining entries are tried in order whenever the primary
+    # raises a retryable error (``ProviderUnavailableError`` or
+    # ``ProviderRateLimitError``). Example::
+    #
+    #     {"whatsapp": ["meta_whatsapp", "twilio_whatsapp"],
+    #      "sms":      ["sms_aggregator", "twilio_sms"]}
+    #
+    # An empty value (the default) disables failover: the registry
+    # returns a single-provider adapter, which preserves the
+    # pre-failover behaviour bit-for-bit. The parser is deliberately
+    # tolerant – a malformed JSON value, a non-object value or a
+    # channel key the registry does not know about is rejected at
+    # boot so a typo does not silently disable message delivery at
+    # runtime. The contract is documented in
+    # :class:`app.adapters.failover.FailoverProvider`.
+    provider_failover_chains: dict[str, list[str]] = Field(
+        default_factory=dict, alias="PROVIDER_FAILOVER_CHAINS"
+    )
+
+    @field_validator("provider_failover_chains", mode="before")
+    @classmethod
+    def _parse_failover_chains(cls, value: object) -> object:
+        """Parse the JSON-encoded chain map from the environment.
+
+        ``pydantic-settings`` hands us a string when the value comes
+        from an env var; we accept the JSON form so deployments do
+        not have to ship a complex value through Pydantic's parser
+        conventions. A ``None`` / empty string means "no chains",
+        which is the same as the empty-dict default.
+        """
+        if value is None or value == "":
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                # A bad JSON payload should not brick the platform
+                # at boot – we surface it as an empty chain and let
+                # the operator notice via the lack of failover. The
+                # alternative (a hard ``ValueError``) would block the
+                # whole API on a single typo.
+                raise ValueError(
+                    "PROVIDER_FAILOVER_CHAINS must be a JSON object "
+                    "mapping channel names to ordered provider lists"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "PROVIDER_FAILOVER_CHAINS must be a JSON object "
+                    "mapping channel names to ordered provider lists"
+                )
+            return parsed
+        return value
 
     # --- Webhooks (delivery receipts) ----------------------------------
     # Timeout (in seconds) for outbound POSTs the platform sends to
