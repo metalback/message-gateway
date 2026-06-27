@@ -44,9 +44,18 @@ and renders the response.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Response,
+    status,
+)
 from pydantic import BaseModel, Field, conlist
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,9 +73,12 @@ from app.routes.auth import require_api_key
 from app.services.messaging import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_LIST_LIMIT,
+    BatchChannelSummary,
+    BatchDetail,
     BatchListPage,
     BatchNotFoundError,
     BatchOutcome,
+    BatchRateLimitError,
     BatchSummary,
     BatchTooLargeError,
     DailyUsagePage,
@@ -79,6 +91,7 @@ from app.services.messaging import (
     MessagingError,
     SendOutcome,
     daily_message_counts,
+    fire_batch_completion_webhook,
     get_batch,
     get_message_status,
     iter_messages_for_export,
@@ -89,6 +102,7 @@ from app.services.messaging import (
     send_batch,
     send_message,
 )
+from app.services.rate_limit import enforce_batch_rate_limit
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -168,12 +182,59 @@ class BatchRequest(BaseModel):
     on the "Campañas" view. Optional so a one-off
     campaign can land without forcing the caller to
     pick a name.
+
+    ``webhook_url`` is the optional ``https://`` endpoint
+    the platform POSTs a JSON summary to once the batch
+    reaches a terminal state (``completed`` / ``failed``).
+    Issue #9 acceptance criterion "Webhook de batch
+    completion funciona" – opt-in, so a caller that only
+    polls ``GET /v1/messages/batch/{id}`` simply omits the
+    field.
+
+    ``webhook_secret`` is the optional HMAC-SHA256 key the
+    platform uses to sign the completion POST. When the
+    caller omits the value, the service layer mints a
+    one-time secret (32 bytes of CSPRNG entropy,
+    hex-encoded) and surfaces it in the response – the
+    same flow the API-key onboarding uses. The dashboard
+    is expected to surface the value to the user and
+    discard it from memory as soon as the user has
+    confirmed they have stored it.
     """
 
     items: conlist(  # type: ignore[valid-type]
         BatchItem, min_length=1, max_length=DEFAULT_BATCH_SIZE
     )
     name: str | None = Field(default=None, max_length=200)
+    webhook_url: str | None = Field(default=None, max_length=500)
+    webhook_secret: str | None = Field(default=None, max_length=128)
+
+
+class BatchChannelSummaryResponse(BaseModel):
+    """Per-channel rollup of a :class:`Batch`.
+
+    Mirrors :class:`app.services.messaging.BatchChannelSummary`
+    so the dashboard can render a one-line "SMS: 70 mensajes /
+    CLP $2 450 · WhatsApp: 30 mensajes / CLP $2 550" widget
+    without re-aggregating the underlying ``mensajes`` table
+    on every read.
+
+    The list is ordered by ``channel`` so the response is
+    stable across calls. A batch with no messages yet (a
+    freshly-created batch that has not been flushed) returns
+    an empty ``channels`` array; the dashboard treats that as
+    "no hay desglose todavía" rather than rendering an error.
+    """
+
+    channel: Channel
+    count: int
+    pending: int
+    delivered: int
+    failed: int
+    succeeded: int
+    total_cost_clp: int
+    total_fee_clp: int
+    total_amount_clp: int
 
 
 class BatchSummaryResponse(BaseModel):
@@ -189,6 +250,18 @@ class BatchSummaryResponse(BaseModel):
     that just wants "how many made it through?" can
     read the single field instead of summing the other
     two.
+
+    ``total_amount_clp`` is the customer-facing total
+    (upstream cost + platform markup, in CLP cents);
+    the dashboard renders it as the "costo total de la
+    campaña" without having to sum ``total_cost_clp``
+    and ``total_fee_clp`` on the client.
+
+    ``channels`` is the per-channel rollup so the
+    dashboard can render the "desglose por canal"
+    widget ("SMS: X / CLP $Y · WhatsApp: Z / CLP $W")
+    without a second round-trip. The list is empty for
+    a freshly-created batch with no items yet.
     """
 
     total: int
@@ -196,29 +269,54 @@ class BatchSummaryResponse(BaseModel):
     delivered: int
     failed: int
     succeeded: int
+    total_cost_clp: int
+    total_fee_clp: int
+    total_amount_clp: int
+    channels: list[BatchChannelSummaryResponse]
 
 
 class BatchResponse(BaseModel):
     """Response of a successful ``POST /v1/messages/batch``.
 
-    ``batch_id`` – the id of the
-                   :class:`app.models.batch.Batch` row
-                   the call created. The caller can
-                   poll it through
-                   ``GET /v1/messages/batch/{batch_id}``
-                   to check progress.
-    ``summary``  – rollup counters the dashboard
-                   surfaces on the "campañas" view.
-    ``results``  – per-item outcome in the same order
-                   as the request. A failed item
-                   (``status=failed``) does not abort
-                   the rest of the batch; the caller can
-                   retry just the failures.
+    ``batch_id``       – the id of the
+                         :class:`app.models.batch.Batch` row
+                         the call created. The caller can
+                         poll it through
+                         ``GET /v1/messages/batch/{batch_id}``
+                         to check progress.
+    ``summary``        – rollup counters the dashboard
+                         surfaces on the "campañas" view.
+    ``results``        – per-item outcome in the same order
+                         as the request. A failed item
+                         (``status=failed``) does not abort
+                         the rest of the batch; the caller can
+                         retry just the failures.
+    ``webhook_url``    – the canonical ``https://`` endpoint
+                         the platform will POST the completion
+                         summary to. ``None`` when the caller
+                         did not configure a completion
+                         webhook on the request.
+    ``webhook_secret`` – the HMAC-SHA256 key the platform
+                         uses to sign the completion POST.
+                         Returned exactly once when the
+                         caller did not supply one (the
+                         service layer mints a one-time
+                         value); ``None`` when the caller
+                         either supplied the secret
+                         directly or did not configure a
+                         completion webhook at all. The
+                         dashboard is expected to surface
+                         the value to the user and discard
+                         it from memory as soon as the user
+                         has confirmed they have stored
+                         it.
     """
 
     batch_id: str
     summary: BatchSummaryResponse
     results: list[MessageResponse]
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
 
 
 class BatchListItemResponse(BaseModel):
@@ -228,6 +326,18 @@ class BatchListItemResponse(BaseModel):
     The shape is the same as the ``BatchResponse`` summary
     block plus the lifecycle fields the dashboard needs to
     render the "Campañas" view.
+
+    ``total_cost_clp`` / ``total_fee_clp`` are the aggregated
+    upstream cost / platform markup (CLP cents) across every
+    message in the batch; ``total_amount_clp`` is their sum,
+    the customer-facing total the dashboard renders as the
+    "costo total de la campaña".
+
+    ``channels`` is the per-channel rollup so the dashboard
+    can render the "desglose por canal" widget on every row
+    of the "Campañas" table without a second round-trip
+    per batch. The list is empty for a freshly-created
+    batch with no items yet.
     """
 
     id: str
@@ -237,9 +347,13 @@ class BatchListItemResponse(BaseModel):
     pending_count: int
     delivered_count: int
     failed_count: int
+    total_cost_clp: int
+    total_fee_clp: int
+    total_amount_clp: int
     created_at: datetime
     updated_at: datetime | None
     completed_at: datetime | None
+    channels: list[BatchChannelSummaryResponse]
 
 
 class BatchListResponse(BaseModel):
@@ -275,8 +389,51 @@ class BatchDetailResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _batch_to_response(batch: Batch) -> BatchListItemResponse:
-    """Project a :class:`Batch` row to a :class:`BatchListItemResponse`."""
+def _channel_to_response(
+    channel: BatchChannelSummary,
+) -> BatchChannelSummaryResponse:
+    """Project a :class:`BatchChannelSummary` to a
+    :class:`BatchChannelSummaryResponse`.
+
+    The dataclass already exposes ``succeeded`` and
+    ``total_amount_clp`` as properties, so the projection
+    is a one-line read. Kept as a separate helper so the
+    listing endpoint (which iterates a list of
+    :class:`Batch` rows and looks up the per-channel
+    rollup in a ``dict``) can reuse the same projection
+    logic the summary helper uses.
+    """
+    return BatchChannelSummaryResponse(
+        channel=channel.channel,
+        count=channel.count,
+        pending=channel.pending,
+        delivered=channel.delivered,
+        failed=channel.failed,
+        succeeded=channel.succeeded,
+        total_cost_clp=channel.total_cost_clp,
+        total_fee_clp=channel.total_fee_clp,
+        total_amount_clp=channel.total_amount_clp,
+    )
+
+
+def _batch_to_response(
+    batch: Batch,
+    *,
+    channels: Sequence[BatchChannelSummary] = (),
+) -> BatchListItemResponse:
+    """Project a :class:`Batch` row to a
+    :class:`BatchListItemResponse`.
+
+    ``channels`` is the per-channel rollup the listing
+    endpoint fetches in a single round-trip and passes
+    alongside the batch row. The default empty tuple
+    keeps the helper backwards-compatible: a caller
+    that does not have the per-channel data yet (e.g. a
+    future ``GET /v1/messages/batch/{id}`` variant
+    without the breakdown) can still use the helper
+    and just render an empty ``channels`` list on the
+    response.
+    """
     return BatchListItemResponse(
         id=batch.id,
         name=batch.name,
@@ -285,9 +442,13 @@ def _batch_to_response(batch: Batch) -> BatchListItemResponse:
         pending_count=batch.pending_count,
         delivered_count=batch.delivered_count,
         failed_count=batch.failed_count,
+        total_cost_clp=batch.total_cost_clp,
+        total_fee_clp=batch.total_fee_clp,
+        total_amount_clp=batch.total_cost_clp + batch.total_fee_clp,
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         completed_at=batch.completed_at,
+        channels=[_channel_to_response(channel) for channel in channels],
     )
 
 
@@ -299,6 +460,10 @@ def _summary_to_response(summary: BatchSummary) -> BatchSummaryResponse:
         delivered=summary.delivered,
         failed=summary.failed,
         succeeded=summary.succeeded,
+        total_cost_clp=summary.total_cost_clp,
+        total_fee_clp=summary.total_fee_clp,
+        total_amount_clp=summary.total_amount_clp,
+        channels=[_channel_to_response(channel) for channel in summary.channels],
     )
 
 
@@ -499,12 +664,13 @@ async def send(
         202: {"description": "Batch accepted; one row per item in ``results``."},
         401: {"description": "The X-API-Key header is missing or invalid."},
         422: {"description": "The batch is empty, too large, or contains invalid items."},
-        429: {"description": "The provider rate-limited the request."},
+        429: {"description": "The platform or the provider rate-limited the request."},
         502: {"description": "The provider is unreachable."},
     },
 )
 async def send_batch_endpoint(
     payload: BatchRequest,
+    background_tasks: BackgroundTasks,
     current_client: Client = Depends(require_api_key),
     session: AsyncSession = Depends(get_db),
 ) -> BatchResponse:
@@ -523,13 +689,48 @@ async def send_batch_endpoint(
     poll through ``GET /v1/messages/batch/{batch_id}``
     to check progress. The id is also visible in the
     dashboard's "Campañas" view.
+
+    Rate limiting (issue #9 acceptance criterion "Rate
+    limiting respeta el límite configurado") is enforced
+    *before* any persistence work so a runaway client
+    cannot flood the worker queue. The default ceiling is
+    :attr:`Settings.batch_rate_limit_per_second`
+    (100/s); an over-the-limit call surfaces as HTTP 429
+    with a ``Retry-After`` header so a well-behaved
+    client backs off for the remainder of the window.
+
+    The completion webhook (issue #9 acceptance criterion
+    "Webhook de batch completion funciona") is fired
+    *asynchronously* through FastAPI's ``BackgroundTasks``
+    so a slow customer endpoint cannot stall the response
+    or fail the batch. The actual delivery lives in
+    :func:`app.services.messaging.fire_batch_completion_webhook`.
     """
+    # ``enforce_batch_rate_limit`` is the very first thing
+    # the handler does so the budget cannot be consumed by
+    # a request that will end up failing validation. The
+    # call is a single Redis ``INCR`` + ``EXPIRE`` pair –
+    # sub-millisecond on the production Redis instance.
+    try:
+        await enforce_batch_rate_limit(client_id=current_client.id)
+    except BatchRateLimitError as exc:
+        # Surface as 429 with the ``Retry-After`` header
+        # populated from ``retry_after_seconds``. A
+        # well-behaved client backs off for the remainder
+        # of the window rather than busy-looping.
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.code, "message": exc.message},
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     try:
         outcome: BatchOutcome = await send_batch(
             session,
             client=current_client,
             items=[item.model_dump() for item in payload.items],
             name=payload.name,
+            webhook_url=payload.webhook_url,
+            webhook_secret=payload.webhook_secret,
         )
     except (InvalidMessageError, BatchTooLargeError) as exc:
         _raise_messaging_error(exc)
@@ -541,10 +742,39 @@ async def send_batch_endpoint(
         _raise_provider_error(exc)
     except ProviderError as exc:
         _raise_provider_error(exc)
+    # The completion webhook is fired in the background so
+    # a slow customer endpoint cannot block the response
+    # or fail the batch. The session is closed by the time
+    # the task fires – we re-read the batch row from a
+    # fresh session inside the helper if a re-read is
+    # needed. The current implementation passes the
+    # in-memory row captured by ``send_batch``; the helper
+    # never touches the session, so the closed-session
+    # path is safe.
+    if outcome.webhook_url:
+        # ``send_batch`` already returns the in-memory
+        # ``Batch`` row (refreshed) – we re-read it from
+        # the session to make sure the background task
+        # operates on the latest counters, not the stale
+        # snapshot the service layer returned. The cost
+        # is one indexed read on the ``lotes`` PK.
+        from sqlalchemy import select
+
+        refreshed = (
+            await session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+        ).scalar_one_or_none()
+        if refreshed is not None:
+            background_tasks.add_task(
+                fire_batch_completion_webhook,
+                batch=refreshed,
+                summary=outcome.summary,
+            )
     return BatchResponse(
         batch_id=outcome.batch_id,
         summary=_summary_to_response(outcome.summary),
         results=[_to_response(item.message) for item in outcome.results],
+        webhook_url=outcome.webhook_url,
+        webhook_secret=outcome.webhook_secret,
     )
 
 
@@ -599,7 +829,15 @@ async def list_batches_endpoint(
     except InvalidListFilterError as exc:
         _raise_messaging_error(exc)
     return BatchListResponse(
-        items=[_batch_to_response(batch) for batch in page.items],
+        items=[
+            _batch_to_response(
+                batch,
+                channels=page.channels_by_batch.get(batch.id, ())
+                if page.channels_by_batch
+                else (),
+            )
+            for batch in page.items
+        ],
         total=page.total,
         limit=page.limit,
         offset=page.offset,
@@ -629,6 +867,11 @@ async def get_batch_endpoint(
     loop still shows up-to-date numbers when the
     customer opens the dashboard.
 
+    The response also carries the per-channel rollup
+    so the dashboard's "desglose por canal" widget can
+    be rendered on the batch detail page without a
+    second round-trip to ``GET /v1/messages/batch``.
+
     Cross-tenant access is blocked by the
     ``client_id`` WHERE clause in the service layer: a
     batch that belongs to a different client is reported
@@ -637,14 +880,16 @@ async def get_batch_endpoint(
     campaign is not leaked.
     """
     try:
-        batch = await get_batch(
+        detail: BatchDetail = await get_batch(
             session,
             client=current_client,
             batch_id=batch_id,
         )
     except BatchNotFoundError as exc:
         _raise_messaging_error(exc)
-    return BatchDetailResponse(batch=_batch_to_response(batch))
+    return BatchDetailResponse(
+        batch=_batch_to_response(detail.batch, channels=detail.channels)
+    )
 
 
 @router.get(

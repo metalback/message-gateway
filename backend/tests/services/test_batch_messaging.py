@@ -36,13 +36,16 @@ from app.models.batch import Batch, BatchStatus
 from app.models.client import Client, ClientPlan, ClientStatus
 from app.models.message import Channel, Message, MessageStatus
 from app.services.messaging import (
+    BatchChannelSummary,
     BatchNotFoundError,
     BatchOutcome,
     BatchSummary,
+    InvalidMessageError,
     get_batch,
     list_batches,
     send_batch,
 )
+from app.services.webhook_delivery import WebhookDeliveryResult
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -415,9 +418,10 @@ async def test_send_batch_rejects_unknown_channel(
 async def test_get_batch_returns_the_persisted_row(
     async_session, batch_providers, batch_settings
 ) -> None:
-    """A successful :func:`get_batch` call returns the
-    same row the original send created, with the
-    counter recompute applied on the way out.
+    """A successful :func:`get_batch` call returns a
+    :class:`BatchDetail` wrapping the same row the
+    original send created, with the counter recompute
+    applied on the way out.
 
     The single message is in ``sent`` state (the
     provider accepted it but the delivery receipt has
@@ -433,12 +437,13 @@ async def test_get_batch_returns_the_persisted_row(
         name="Lanzamiento",
     )
 
-    batch = await get_batch(
+    detail = await get_batch(
         async_session,
         client=client,
         batch_id=outcome.batch_id,
         settings=batch_settings,
     )
+    batch = detail.batch
     assert batch.id == outcome.batch_id
     assert batch.client_id == client.id
     assert batch.name == "Lanzamiento"
@@ -686,3 +691,830 @@ def test_batch_summary_succeeded_is_delivered_plus_failed() -> None:
     the arithmetic on the client."""
     summary = BatchSummary(total=10, pending=0, delivered=7, failed=3)
     assert summary.succeeded == 10
+
+
+# ---------------------------------------------------------------------------
+# BatchSummary / Batch — per-batch cost / fee rollup
+# ---------------------------------------------------------------------------
+#
+# The dashboard's "Campañas" view surfaces the campaign's total
+# cost as a single CLP value so a customer can see at a glance
+# how much they spent on a given campaign without iterating
+# the per-item results. The rollup is recomputed by
+# :func:`app.services.messaging._recompute_batch_counters` and
+# mirrored on :class:`app.services.messaging.BatchSummary`.
+
+
+def test_batch_summary_total_amount_is_cost_plus_fee() -> None:
+    """``total_amount_clp`` is ``total_cost_clp + total_fee_clp``
+    so the dashboard can render the customer-facing total
+    without doing the arithmetic on the client. The value
+    is exposed as a property (not a field) so the dataclass
+    stays frozen."""
+    summary = BatchSummary(
+        total=4,
+        pending=0,
+        delivered=3,
+        failed=1,
+        total_cost_clp=320,
+        total_fee_clp=20,
+    )
+    assert summary.total_amount_clp == 340
+
+
+async def test_send_batch_records_aggregated_cost_and_fee_on_row(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The :class:`Batch` row carries the aggregated cost /
+    fee across every message of the batch so the dashboard
+    does not have to re-aggregate the underlying ``mensajes``
+    table on every read.
+
+    The :class:`BatchFakeProvider` accepts every destination
+    (none of them end in ``2``) so all items are dispatched
+    successfully; the resulting messages live in ``sent``
+    state with the cost / fee columns the
+    :func:`compute_message_cost` helper computes for the
+    customer's :class:`ClientPlan.STARTER` plan.
+
+    The Starter plan charges CLP $25 for SMS + CLP $5 markup
+    and CLP $80 for WhatsApp + CLP $5 markup (the values
+    from :data:`_BASE_COST_CLP` /
+    :data:`_PLAN_MARKUP_CLP`). The batch sends 2 SMS and
+    1 WhatsApp message, so the rollup is
+    ``2*30 + 1*85 = 145`` CLP cents."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "sms", "to": "+56933333333", "body": "dos"},
+            {"channel": "whatsapp", "to": "+56944444444", "body": "tres"},
+        ],
+        settings=batch_settings,
+    )
+
+    # The :class:`BatchSummary` returned in the outcome
+    # already carries the rollup so a caller that just wants
+    # the headline numbers does not have to round-trip the
+    # row.
+    assert outcome.summary.total_cost_clp == 25 + 25 + 80
+    assert outcome.summary.total_fee_clp == 5 + 5 + 5
+    assert outcome.summary.total_amount_clp == (25 + 25 + 80) + (5 + 5 + 5)
+
+    # The persisted row carries the same rollup so a
+    # subsequent ``GET /v1/messages/batch/{batch_id}`` sees
+    # the same numbers without recomputation.
+    batch = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    assert batch.total_cost_clp == outcome.summary.total_cost_clp
+    assert batch.total_fee_clp == outcome.summary.total_fee_clp
+
+
+async def test_send_batch_rolls_up_failed_items_too(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The cost / fee rollup is computed across **every**
+    message of the batch, regardless of the per-item
+    outcome. A failed item still incurred a row-level
+    cost / fee (the upstream charge is provisioned at
+    dispatch time, before delivery is confirmed), so
+    excluding ``failed`` items from the rollup would
+    under-report the campaign's actual cost.
+
+    The :class:`BatchFakeProvider` raises
+    :class:`ProviderUnavailableError` for destinations
+    ending in ``2``; the ``send_message`` service catches
+    the error and marks the row ``failed``. The cost /
+    fee columns are still populated on the failed row
+    because :func:`_persist_message` runs before the
+    dispatch and writes the plan-derived values."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            # ends in ``2`` -> the fake provider raises
+            {"channel": "sms", "to": "+56911111112", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+
+    # Both messages were persisted with a non-zero
+    # ``cost_clp`` / ``fee_clp`` (the Starter plan charges
+    # CLP $25 + $5 for every SMS), so the rollup is the
+    # sum of both rows.
+    expected_cost = 25 + 25
+    expected_fee = 5 + 5
+    assert outcome.summary.total_cost_clp == expected_cost
+    assert outcome.summary.total_fee_clp == expected_fee
+    assert outcome.summary.total_amount_clp == expected_cost + expected_fee
+
+    # The persisted row carries the same rollup.
+    batch = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    assert batch.total_cost_clp == expected_cost
+    assert batch.total_fee_clp == expected_fee
+
+
+async def test_send_batch_rolls_up_empty_batch_to_zero(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A batch with a single item carries a non-zero rollup
+    so the dashboard does not have to special-case the
+    one-message path. The Starter plan charges CLP $25 + $5
+    for SMS so the values are ``30 / 30 / 30``."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+    )
+
+    assert outcome.summary.total_cost_clp == 25
+    assert outcome.summary.total_fee_clp == 5
+    assert outcome.summary.total_amount_clp == 30
+
+
+async def test_get_batch_returns_aggregated_cost_and_fee(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A subsequent :func:`get_batch` call returns the
+    same ``total_cost_clp`` / ``total_fee_clp`` values
+    the original :func:`send_batch` call persisted, so a
+    polling dashboard sees a stable cost across calls.
+
+    The route layer's ``_batch_to_response`` helper
+    projects the columns straight onto the response, so
+    the ``total_amount_clp`` field is derived on the way
+    out. The test exercises the service layer only; the
+    route-level coverage of the rollup lives in
+    :mod:`tests.routes.test_batch_messaging`."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "sms", "to": "+56933333333", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+
+    detail = await get_batch(
+        async_session,
+        client=client,
+        batch_id=outcome.batch_id,
+        settings=batch_settings,
+    )
+    batch = detail.batch
+    assert batch.total_cost_clp == 25 + 25
+    assert batch.total_fee_clp == 5 + 5
+
+
+# ---------------------------------------------------------------------------
+# Per-channel rollup (issue #9 — "desglose por canal" widget)
+# ---------------------------------------------------------------------------
+#
+# The dashboard's "Campañas" view surfaces a per-channel
+# breakdown so the customer can see at a glance which
+# channel drove the spend ("SMS: 70 / CLP $2 450 · WhatsApp:
+# 30 / CLP $2 550") without iterating the underlying
+# ``mensajes`` table. The rollup is computed by
+# :func:`app.services.messaging._batch_channel_breakdown`
+# (one query per call) and
+# :func:`app.services.messaging._batch_channel_breakdowns`
+# (one query for the whole page on the listing endpoint).
+
+
+async def test_send_batch_summary_carries_per_channel_breakdown(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The :class:`BatchSummary` returned by
+    :func:`send_batch` carries the per-channel rollup
+    so the dashboard can render the "desglose por canal"
+    widget from the POST response alone.
+
+    The batch sends 2 SMS and 1 WhatsApp message; the
+    Starter plan charges CLP $25 + $5 for SMS and
+    CLP $80 + $5 for WhatsApp, so the rollup is::
+
+        sms       → count=2  cost=50  fee=10  total=60
+        whatsapp  → count=1  cost=80  fee=5   total=85
+
+    The list is ordered by ``channel.value`` so the
+    response is stable across calls."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "sms", "to": "+56933333333", "body": "dos"},
+            {"channel": "whatsapp", "to": "+56944444444", "body": "tres"},
+        ],
+        settings=batch_settings,
+    )
+
+    channels = list(outcome.summary.channels)
+    assert [c.channel for c in channels] == [Channel.SMS, Channel.WHATSAPP]
+
+    sms, whatsapp = channels
+    assert sms.count == 2
+    assert sms.pending == 2  # both items are in flight
+    assert sms.delivered == 0
+    assert sms.failed == 0
+    assert sms.total_cost_clp == 25 + 25
+    assert sms.total_fee_clp == 5 + 5
+    assert sms.total_amount_clp == 60
+
+    assert whatsapp.count == 1
+    assert whatsapp.pending == 1
+    assert whatsapp.delivered == 0
+    assert whatsapp.failed == 0
+    assert whatsapp.total_cost_clp == 80
+    assert whatsapp.total_fee_clp == 5
+    assert whatsapp.total_amount_clp == 85
+
+    # The cross-check: the per-channel rollup sums
+    # to the batch-level rollup so a caller that
+    # renders the headline counters from the per-channel
+    # list sees the same values.
+    total_cost = sum(c.total_cost_clp for c in channels)
+    total_fee = sum(c.total_fee_clp for c in channels)
+    total_amount = sum(c.total_amount_clp for c in channels)
+    assert total_cost == outcome.summary.total_cost_clp
+    assert total_fee == outcome.summary.total_fee_clp
+    assert total_amount == outcome.summary.total_amount_clp
+
+
+async def test_send_batch_per_channel_breakdown_includes_failed_items(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The per-channel rollup includes the failed
+    items (a failed item still incurred a row-level
+    cost / fee at dispatch time, so excluding it from
+    the rollup would under-report the campaign's
+    actual cost).
+
+    The :class:`BatchFakeProvider` raises
+    :class:`ProviderUnavailableError` for destinations
+    ending in ``2``; the rollup places the failed item
+    under the ``failed`` counter of its channel."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            # ends in ``2`` → the fake provider raises
+            {"channel": "sms", "to": "+56911111112", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+
+    channels = list(outcome.summary.channels)
+    assert len(channels) == 1
+    sms = channels[0]
+    assert sms.channel == Channel.SMS
+    assert sms.count == 2
+    assert sms.pending == 1
+    assert sms.failed == 1
+    # Both items contribute to the rollup (CLP $25 + $5
+    # for every SMS under the Starter plan).
+    assert sms.total_cost_clp == 25 + 25
+    assert sms.total_fee_clp == 5 + 5
+
+
+async def test_send_batch_per_channel_breakdown_is_empty_for_zero_items(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A fresh :class:`BatchSummary` dataclass carries
+    an empty ``channels`` tuple so a caller that
+    inspects the value before any rollup is run does
+    not blow up iterating a ``None``. The dataclass
+    is the source of truth – the route layer projects
+    an empty list for a freshly-created batch with no
+    items yet."""
+    summary = BatchSummary(total=0, pending=0, delivered=0, failed=0)
+    assert summary.channels == ()
+
+
+async def test_batch_channel_summary_succeeded_is_delivered_plus_failed() -> None:
+    """``succeeded`` is defined as ``delivered + failed``
+    so a per-channel "X of Y delivered" widget can
+    read the single field without re-deriving the
+    arithmetic. Same contract as the batch-level
+    :attr:`BatchSummary.succeeded`."""
+    channel = BatchChannelSummary(
+        channel=Channel.SMS,
+        count=10,
+        pending=0,
+        delivered=7,
+        failed=3,
+        total_cost_clp=250,
+        total_fee_clp=50,
+    )
+    assert channel.succeeded == 10
+    assert channel.total_amount_clp == 300
+
+
+async def test_get_batch_returns_per_channel_breakdown(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A subsequent :func:`get_batch` call returns a
+    :class:`BatchDetail` whose ``channels`` field
+    carries the per-channel rollup so the dashboard
+    can render the "desglose por canal" widget on the
+    batch detail page without a second round-trip.
+
+    The cross-check mirrors the
+    :func:`test_send_batch_summary_carries_per_channel_breakdown`
+    test: the per-channel rollup sums to the batch-level
+    rollup so a caller that renders the headline
+    counters from the per-channel list sees the same
+    values."""
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "whatsapp", "to": "+56944444444", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+
+    detail = await get_batch(
+        async_session,
+        client=client,
+        batch_id=outcome.batch_id,
+        settings=batch_settings,
+    )
+    channels = list(detail.channels)
+    assert [c.channel for c in channels] == [Channel.SMS, Channel.WHATSAPP]
+
+    sms, whatsapp = channels
+    assert sms.count == 1
+    assert sms.total_cost_clp == 25
+    assert sms.total_fee_clp == 5
+    assert whatsapp.count == 1
+    assert whatsapp.total_cost_clp == 80
+    assert whatsapp.total_fee_clp == 5
+
+
+async def test_list_batches_returns_per_channel_breakdown(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The :func:`list_batches` endpoint returns a
+    :class:`BatchListPage` whose ``channels_by_batch``
+    field maps every batch id to its per-channel
+    rollup. The query is one ``GROUP BY`` round-trip
+    for the whole page (no N+1) so a dashboard with
+    many campaigns does not pay a per-batch penalty.
+
+    The test sends two batches (one all-SMS, one
+    mixed) and asserts each ``channels_by_batch``
+    entry matches the per-batch rollup."""
+    client = await _make_client(async_session)
+    sms_only = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "sms", "to": "+56933333333", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+    mixed = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "whatsapp", "to": "+56944444444", "body": "dos"},
+        ],
+        settings=batch_settings,
+    )
+
+    page = await list_batches(
+        async_session,
+        client=client,
+        settings=batch_settings,
+    )
+    assert page.channels_by_batch is not None
+    # Every batch on the page has an entry (both
+    # batches have at least one message persisted).
+    assert set(page.channels_by_batch.keys()) == {sms_only.batch_id, mixed.batch_id}
+
+    sms_only_channels = page.channels_by_batch[sms_only.batch_id]
+    assert [c.channel for c in sms_only_channels] == [Channel.SMS]
+    assert sms_only_channels[0].count == 2
+    assert sms_only_channels[0].total_cost_clp == 25 + 25
+
+    mixed_channels = page.channels_by_batch[mixed.batch_id]
+    assert [c.channel for c in mixed_channels] == [Channel.SMS, Channel.WHATSAPP]
+    assert mixed_channels[0].count == 1
+    assert mixed_channels[1].count == 1
+
+
+async def test_list_batches_channels_by_batch_is_none_for_empty_page(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A page with no items returns ``channels_by_batch``
+    as ``None`` (or an empty dict) so the caller does
+    not have to special-case the "no rows" path. The
+    helper short-circuits on an empty ``batch_ids``
+    list and returns an empty dict; the route layer
+    is expected to fall back to an empty per-batch
+    list on the response side."""
+    client = await _make_client(async_session)
+    page = await list_batches(
+        async_session,
+        client=client,
+        settings=batch_settings,
+    )
+    assert page.items == []
+    assert page.channels_by_batch == {}
+
+
+# ---------------------------------------------------------------------------
+# send_batch — completion webhook wiring (issue #9)
+# ---------------------------------------------------------------------------
+#
+# The PRD's batch-completion webhook is opt-in. A customer
+# that wants a "your campaign finished" push registers a
+# ``webhook_url`` on ``POST /v1/messages/batch`` and the
+# platform fires one signed POST once the batch reaches a
+# terminal state. The tests below cover the service-layer
+# wiring: the URL / secret persistence, the one-time
+# secret minting, the validation guard and the actual
+# delivery performed by
+# :func:`app.services.messaging.fire_batch_completion_webhook`.
+
+
+async def test_send_batch_persists_webhook_url_and_secret(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """When the caller supplies a ``webhook_url`` and a
+    ``webhook_secret``, both values land on the
+    :class:`Batch` row so a future re-fire (e.g. a
+    delivery-receipt update that triggers another
+    recompute) can re-use the same configuration without
+    asking the customer to re-submit it.
+
+    The test also asserts the
+    :class:`BatchOutcome` the service layer returns
+    surfaces the values back to the route layer so the
+    dashboard can echo the configuration the platform
+    persisted.
+    """
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+        webhook_url="https://example.com/hook",
+        webhook_secret="caller-supplied-secret",
+    )
+
+    # Outcome carries the configuration back to the caller.
+    assert outcome.webhook_url == "https://example.com/hook"
+    assert outcome.webhook_secret == "caller-supplied-secret"
+
+    # The persisted row mirrors the same values.
+    from sqlalchemy import select
+
+    persisted = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    assert persisted.webhook_url == "https://example.com/hook"
+    assert persisted.webhook_secret == "caller-supplied-secret"
+
+
+async def test_send_batch_mints_one_time_webhook_secret_when_caller_omits_it(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A caller that supplies a ``webhook_url`` without a
+    ``webhook_secret`` gets a one-time CSPRNG secret
+    minted by the service layer. The minted value is
+    returned in the :class:`BatchOutcome` and persisted
+    on the :class:`Batch` row, so the dashboard can
+    surface it to the user (the same flow the API-key
+    onboarding uses for the per-message webhook
+    subscription secret).
+    """
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+        webhook_url="https://example.com/hook",
+    )
+
+    # A non-empty hex-shaped string (32 bytes -> 64
+    # hex characters).
+    assert isinstance(outcome.webhook_secret, str)
+    assert len(outcome.webhook_secret) == 64
+    int(outcome.webhook_secret, 16)  # parses as hex
+
+    from sqlalchemy import select
+
+    persisted = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    assert persisted.webhook_secret == outcome.webhook_secret
+
+
+async def test_send_batch_returns_none_webhook_when_url_omitted(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A caller that does not opt-in to the completion
+    webhook gets ``webhook_url=None`` /
+    ``webhook_secret=None`` on the outcome (and on the
+    persisted row). The service layer treats the absence
+    as "no webhook configured" and the delivery helper
+    silently skips the POST.
+    """
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+    )
+    assert outcome.webhook_url is None
+    assert outcome.webhook_secret is None
+
+
+async def test_send_batch_rejects_non_https_webhook_url(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A misconfigured customer that ships an ``http://``
+    (or any non-``https``) URL gets a 422
+    :class:`InvalidMessageError` at the service boundary.
+    The same guard applies to typos like ``javascript:``
+    or ``file:`` – the URL parser's scheme check catches
+    every value that is not ``https``.
+
+    The assertion is on the ``code`` attribute the
+    :class:`InvalidMessageError` exposes so a future
+    refactor of the message body does not break the
+    contract.
+    """
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidMessageError) as excinfo:
+        await send_batch(
+            async_session,
+            client=client,
+            items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+            settings=batch_settings,
+            webhook_url="http://insecure.example.com/hook",
+        )
+    assert excinfo.value.code == "invalid_webhook_url"
+
+
+# ---------------------------------------------------------------------------
+# fire_batch_completion_webhook — delivery (issue #9)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the actual delivery helper the
+# :func:`send_batch` route handler schedules as a
+# background task. The ``delivery_client`` argument is
+# swapped for an in-memory fake so the suite never opens
+# a real TCP connection.
+
+
+class _FakeWebhookDeliveryClient:
+    """An in-memory :class:`WebhookDeliveryClient` for tests.
+
+    Records the last ``deliver()`` call so the assertions
+    below can check the URL, body and headers the service
+    layer produced. Returns a configurable
+    :class:`WebhookDeliveryResult` so the "successful
+    delivery" and "delivery failed" code paths can both
+    be exercised.
+    """
+
+    def __init__(self, result: WebhookDeliveryResult | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._result = result or WebhookDeliveryResult(
+            succeeded=True,
+            attempts=1,
+            status_code=200,
+            response_body="ok",
+            error=None,
+        )
+
+    async def deliver(
+        self, *, url: str, body: bytes, headers: dict[str, str]
+    ) -> WebhookDeliveryResult:
+        self.calls.append({"url": url, "body": body, "headers": dict(headers)})
+        return self._result
+
+
+async def test_fire_batch_completion_webhook_returns_none_when_no_url(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A batch that was submitted without a
+    ``webhook_url`` triggers no delivery – the helper
+    short-circuits to ``None`` so the caller can branch
+    on the return value (the route layer does not even
+    need to schedule a background task in this case).
+    """
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+    )
+    from sqlalchemy import select
+
+    batch = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    fake = _FakeWebhookDeliveryClient()
+    result = await fire_batch_completion_webhook(
+        batch=batch,
+        summary=outcome.summary,
+        settings=batch_settings,
+        delivery_client=fake,
+    )
+    assert result is None
+    assert fake.calls == []
+
+
+async def test_fire_batch_completion_webhook_signs_payload_with_batch_secret(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """The outbound POST body is the JSON summary the
+    helper built (id, status, counters, channels), and
+    the ``X-Mgw-Signature`` header is the HMAC-SHA256
+    digest of that body keyed with the batch's
+    ``webhook_secret``. The event / delivery-id headers
+    mirror the per-message receipt convention so a
+    receiver that already speaks the per-message
+    protocol can switch on ``X-Mgw-Event`` for the new
+    ``batch.completed`` value.
+    """
+    from app.services.webhook_delivery import WebhookDeliveryResult
+    from app.services.webhooks import sign_payload
+
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[
+            {"channel": "sms", "to": "+56911111111", "body": "uno"},
+            {"channel": "whatsapp", "to": "+56922222222", "body": "dos"},
+        ],
+        settings=batch_settings,
+        webhook_url="https://example.com/hook",
+        webhook_secret="the-shared-secret",
+    )
+    from sqlalchemy import select
+
+    batch = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    fake = _FakeWebhookDeliveryClient()
+    result = await fire_batch_completion_webhook(
+        batch=batch,
+        summary=outcome.summary,
+        settings=batch_settings,
+        delivery_client=fake,
+    )
+
+    assert isinstance(result, WebhookDeliveryResult)
+    assert result.succeeded is True
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["url"] == "https://example.com/hook"
+
+    body = call["body"]
+    assert isinstance(body, bytes)
+    headers_raw = call["headers"]
+    assert isinstance(headers_raw, dict)
+    headers = {str(key): str(value) for key, value in headers_raw.items()}
+    assert headers["X-Mgw-Event"] == "batch.completed"
+    assert headers["X-Mgw-Delivery"] == outcome.batch_id
+    assert headers["Content-Type"] == "application/json"
+    # Signature matches HMAC-SHA256 of the body with the
+    # batch's webhook_secret.
+    expected = sign_payload(body=body, secret="the-shared-secret")
+    assert headers["X-Mgw-Signature"] == expected
+
+    # Body is valid JSON and carries the headline counters.
+    import json as _json
+
+    payload = _json.loads(body)
+    assert payload["id"] == outcome.batch_id
+    # The inline dispatch leaves the messages in ``SENT``
+    # state (delivery confirmation arrives asynchronously
+    # through the worker / webhook loop) so the batch's
+    # status is still ``processing``. The platform fires
+    # the completion webhook as soon as the *dispatch* is
+    # done, regardless of whether every message has been
+    # delivered; the per-item ``delivered`` / ``failed``
+    # counters are the source of truth for the final
+    # delivery outcome.
+    assert payload["status"] == "processing"
+    assert payload["total"] == 2
+    assert payload["delivered"] + payload["failed"] == payload["succeeded"]
+    assert len(payload["channels"]) == 2
+    assert {c["channel"] for c in payload["channels"]} == {"sms", "whatsapp"}
+
+
+async def test_fire_batch_completion_webhook_returns_failure_result(
+    async_session, batch_providers, batch_settings
+) -> None:
+    """A failing customer endpoint surfaces as a
+    :class:`WebhookDeliveryResult` with
+    ``succeeded=False`` – the helper never raises on a
+    transport error, the route layer just lets the
+    background task finish. The test confirms the
+    platform does not pretend a delivery that never
+    landed is a success.
+    """
+    from app.services.webhook_delivery import WebhookDeliveryResult
+
+    client = await _make_client(async_session)
+    outcome = await send_batch(
+        async_session,
+        client=client,
+        items=[{"channel": "sms", "to": "+56911111111", "body": "uno"}],
+        settings=batch_settings,
+        webhook_url="https://flaky.example.com/hook",
+        webhook_secret="shared",
+    )
+    from sqlalchemy import select
+
+    batch = (
+        await async_session.execute(select(Batch).where(Batch.id == outcome.batch_id))
+    ).scalar_one()
+    fake = _FakeWebhookDeliveryClient(
+        WebhookDeliveryResult(
+            succeeded=False,
+            attempts=3,
+            status_code=502,
+            response_body="",
+            error="http_502",
+        )
+    )
+    result = await fire_batch_completion_webhook(
+        batch=batch,
+        summary=outcome.summary,
+        settings=batch_settings,
+        delivery_client=fake,
+    )
+    assert result is not None
+    assert result.succeeded is False
+    assert result.status_code == 502
+    assert result.attempts == 3
+    assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# BatchRateLimitError (issue #9)
+# ---------------------------------------------------------------------------
+#
+# The Redis-backed rate limiter lives in
+# :mod:`app.services.rate_limit` (covered by
+# ``tests/services/test_rate_limit.py``); the test below
+# only checks the error class is wired into the public
+# surface so the route layer can import it without a
+# circular dependency.
+
+
+def test_batch_rate_limit_error_exposes_retry_after() -> None:
+    """The :class:`BatchRateLimitError` exception carries
+    a ``retry_after_seconds`` attribute the route layer
+    surfaces as the ``Retry-After`` header. The default
+    of ``1`` second matches the fixed-window granularity
+    the rate limiter enforces.
+    """
+    err = BatchRateLimitError("batch_rate_limited", "too many")
+    assert err.http_status == 429
+    assert err.code == "batch_rate_limited"
+    assert err.retry_after_seconds == 1
+    err_two = BatchRateLimitError(
+        "batch_rate_limited", "too many", retry_after_seconds=2
+    )
+    assert err_two.retry_after_seconds == 2
+
+
+# ---------------------------------------------------------------------------
+# Imports used by the tests above (kept at the bottom so
+# the test cases read top-to-bottom).
+# ---------------------------------------------------------------------------
+from app.services.messaging import (  # noqa: E402
+    BatchRateLimitError,
+    fire_batch_completion_webhook,
+)

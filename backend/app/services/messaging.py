@@ -72,6 +72,15 @@ Public functions:
                                   billing service can use the
                                   same logic without having to
                                   fire a real provider call.
+- :func:`fire_batch_completion_webhook` – POST the
+                                  campaign summary to the
+                                  customer's ``webhook_url``
+                                  when a batch reaches a
+                                  terminal state. Opt-in
+                                  (issue #9 acceptance
+                                  criterion: "Webhook de
+                                  batch completion
+                                  funciona").
 """
 
 from __future__ import annotations
@@ -82,7 +91,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,10 +104,28 @@ from app.config import Settings, get_settings
 from app.models.batch import Batch, BatchStatus
 from app.models.client import Client, ClientPlan
 from app.models.message import Channel, Message, MessageStatus
-from app.observability import normalise_phone
+from app.observability import get_logger, normalise_phone
 
 if TYPE_CHECKING:
     from app.adapters.base import BaseProvider
+    from app.services.webhook_delivery import WebhookDeliveryResult
+
+    class _WebhookDeliveryLike(Protocol):
+        """Structural type for the webhook delivery seam.
+
+        :func:`fire_batch_completion_webhook` only depends
+        on a single ``deliver`` method, so accepting the
+        protocol (rather than the concrete
+        :class:`WebhookDeliveryClient`) keeps the unit
+        tests honest: a hand-rolled fake with the right
+        shape is a valid injection, and a future
+        refactor that swaps the underlying client (e.g.
+        for an aiohttp-based one) does not have to
+        inherit the current class."""
+
+        async def deliver(
+            self, *, url: str, body: bytes, headers: dict[str, str]
+        ) -> WebhookDeliveryResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +258,34 @@ class InvalidListFilterError(MessagingError):
     code = "invalid_list_filter"
 
 
+class BatchRateLimitError(MessagingError):
+    """The per-tenant batch rate limit was exceeded.
+
+    The platform throttles ``POST /v1/messages/batch`` per
+    client id (see :mod:`app.services.rate_limit`) so a
+    single customer cannot flood the worker queue. The
+    default ceiling is :attr:`Settings.batch_rate_limit_per_second`
+    (100/s). The exception is surfaced as HTTP 429 by the
+    route layer; the ``retry_after`` header is populated
+    from :attr:`retry_after_seconds` so a well-behaved
+    client backs off for the remainder of the window
+    rather than busy-looping.
+    """
+
+    http_status = 429
+    code = "batch_rate_limited"
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retry_after_seconds: int = 1,
+    ) -> None:
+        super().__init__(code, message)
+        self.retry_after_seconds = int(retry_after_seconds)
+
+
 # ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
@@ -255,24 +310,113 @@ class SendOutcome:
 class BatchOutcome:
     """Outcome of a :func:`send_batch` call.
 
-    ``batch_id``     – UUID of the :class:`app.models.batch.Batch`
-                       row the call created. The route layer
-                       surfaces it in the response so the caller
-                       can poll progress through
-                       :func:`get_batch` / :func:`list_batches`.
-    ``results``      – per-item outcome in the same order as
-                       the request. The route layer uses this
-                       to render the ``results`` array in the
-                       response.
-    ``summary``      – rollup counters the route layer projects
-                       onto the response so a caller can render
-                       a "X delivered / Y failed" widget
-                       without re-iterating the results.
+    ``batch_id``        – UUID of the :class:`app.models.batch.Batch`
+                          row the call created. The route layer
+                          surfaces it in the response so the caller
+                          can poll progress through
+                          :func:`get_batch` / :func:`list_batches`.
+    ``results``         – per-item outcome in the same order as
+                          the request. The route layer uses this
+                          to render the ``results`` array in the
+                          response.
+    ``summary``         – rollup counters the route layer projects
+                          onto the response so a caller can render
+                          a "X delivered / Y failed" widget
+                          without re-iterating the results.
+    ``webhook_url``     – the canonical ``https://`` endpoint the
+                          platform will POST the completion
+                          summary to. ``None`` when the caller
+                          did not configure a completion webhook
+                          on the request. Echoed back to the
+                          caller so the dashboard can confirm
+                          the value the platform persisted.
+    ``webhook_secret``  – the HMAC-SHA256 key the platform will
+                          sign the completion POST with. Returned
+                          exactly once: the caller is expected
+                          to surface it to the user (or store it
+                          in their secret manager) and discard it
+                          from memory as soon as the call
+                          returns. ``None`` when no webhook was
+                          configured; a one-time secret the
+                          platform just minted is surfaced under
+                          :attr:`webhook_secret` so the customer
+                          can verify the body out-of-band. The
+                          value is also persisted on the
+                          :class:`Batch` row so a future
+                          re-fire does not have to mint a
+                          second one.
     """
 
     batch_id: str
     results: list[SendOutcome]
     summary: BatchSummary
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchChannelSummary:
+    """Per-channel rollup of a :class:`Batch`.
+
+    Mirrors the same per-batch cost / fee rollup the
+    :class:`BatchSummary` carries, but **broken down by
+    channel** so the dashboard can render a one-line
+    "SMS: 70 mensajes / CLP $2 450 · WhatsApp: 30 mensajes
+    / CLP $2 550" widget without re-iterating the
+    underlying ``mensajes`` table.
+
+    The fields mirror the Batch-level rollup so a caller
+    can sum ``channels[i].count`` to recover
+    :attr:`BatchSummary.total` and
+    ``sum(channels[i].total_cost_clp for ...)`` to recover
+    :attr:`BatchSummary.total_cost_clp`:
+
+    - ``channel``       – the :class:`Channel` this row
+                          summarises.
+    - ``count``         – total messages of the batch
+                          bound for this channel.
+    - ``pending``       – items still in flight
+                          (``pending`` / ``queued`` /
+                          ``sent`` / ``unknown``).
+    - ``delivered``     – items in ``delivered`` state.
+    - ``failed``        – items in ``failed`` state.
+    - ``total_cost_clp`` – aggregated upstream cost (CLP
+                           cents) for this channel.
+    - ``total_fee_clp``  – aggregated platform markup
+                           (CLP cents) for this channel.
+    """
+
+    channel: Channel
+    count: int
+    pending: int
+    delivered: int
+    failed: int
+    total_cost_clp: int
+    total_fee_clp: int
+
+    @property
+    def succeeded(self) -> int:
+        """Return ``delivered + failed`` for this channel.
+
+        Same contract as :attr:`BatchSummary.succeeded`:
+        the value is the number of items that reached a
+        terminal state. A dashboard that wants a
+        per-channel "X of Y delivered" widget can read
+        the single field without re-deriving the
+        arithmetic.
+        """
+        return self.delivered + self.failed
+
+    @property
+    def total_amount_clp(self) -> int:
+        """Return ``total_cost_clp + total_fee_clp``.
+
+        Same convenience as
+        :attr:`BatchSummary.total_amount_clp`; the value
+        is the customer-facing total for this channel
+        (upstream cost + platform markup).
+        """
+        return self.total_cost_clp + self.total_fee_clp
 
 
 @dataclass(frozen=True)
@@ -297,12 +441,35 @@ class BatchSummary:
                        here so a caller that just wants
                        "how many made it through?" does not
                        have to re-derive the value.
+    ``total_cost_clp`` – aggregated upstream cost (CLP cents)
+                         across every message of the batch.
+                         Mirrors :attr:`Batch.total_cost_clp`.
+    ``total_fee_clp``  – aggregated platform markup (CLP cents)
+                         across every message of the batch.
+                         Mirrors :attr:`Batch.total_fee_clp`.
+    ``total_amount_clp`` – ``total_cost_clp + total_fee_clp``
+                           convenience for the dashboard's
+                           "costo total de la campaña" widget.
+    ``channels``     – per-channel rollup (list of
+                       :class:`BatchChannelSummary`). One
+                       row per :class:`Channel` value the
+                       batch actually used, ordered by
+                       the channel name for stable
+                       rendering. The list is empty for
+                       a freshly-created batch with no
+                       items yet (the service layer only
+                       ever sets ``channels`` once at
+                       least one message has been
+                       persisted).
     """
 
     total: int
     pending: int
     delivered: int
     failed: int
+    total_cost_clp: int = 0
+    total_fee_clp: int = 0
+    channels: tuple[BatchChannelSummary, ...] = ()
 
     @property
     def succeeded(self) -> int:
@@ -315,6 +482,44 @@ class BatchSummary:
         where ``total == succeeded``).
         """
         return self.delivered + self.failed
+
+    @property
+    def total_amount_clp(self) -> int:
+        """Return ``total_cost_clp + total_fee_clp``.
+
+        Convenience for the dashboard's "costo total" widget:
+        the customer-facing number is the sum of the upstream
+        cost and the platform markup, so the value is a
+        one-line render rather than a client-side sum.
+        """
+        return self.total_cost_clp + self.total_fee_clp
+
+
+@dataclass(frozen=True)
+class BatchDetail:
+    """A :class:`Batch` row paired with its per-channel rollup.
+
+    Returned by :func:`get_batch` so the route layer can
+    render the batch's headline counters and the
+    per-channel breakdown (``"SMS: 70 / CLP $2 450 ·
+    WhatsApp: 30 / CLP $2 550"``) in a single
+    round-trip. Splitting the result into ``batch`` /
+    ``channels`` keeps the existing route projection
+    helpers in :mod:`app.routes.messages` (which already
+    know how to render a bare :class:`Batch` row) usable
+    unchanged – the only new field is the per-channel
+    list, surfaced as the ``channels`` field on
+    :class:`BatchDetailResponse`.
+
+    The pair is returned as a frozen dataclass (rather
+    than attaching a transient attribute to the
+    :class:`Batch` ORM object) so the route layer does
+    not have to know whether the call refreshed the
+    in-memory copy of the row.
+    """
+
+    batch: Batch
+    channels: tuple[BatchChannelSummary, ...]
 
 
 @dataclass(frozen=True)
@@ -333,6 +538,18 @@ class BatchListPage:
     ``offset``     – the offset that was applied.
     ``has_more``   – ``True`` when at least one more batch
                      exists after this page.
+    ``channels_by_batch`` – per-batch :class:`BatchChannelSummary`
+                            rollup keyed by the batch id. The
+                            map only contains a key for
+                            batches that have at least one
+                            message persisted; the route
+                            layer is expected to render an
+                            empty ``channels`` list for
+                            batches that do not appear in
+                            the map. Computing the rollup
+                            here (one query for the whole
+                            page) avoids the N+1 trap a
+                            per-row query would introduce.
     """
 
     items: list[Batch]
@@ -340,6 +557,7 @@ class BatchListPage:
     limit: int
     offset: int
     has_more: bool
+    channels_by_batch: dict[str, tuple[BatchChannelSummary, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -531,6 +749,87 @@ def _validate_destination(channel: Channel, to: str) -> str:
             "destination must be a valid Chilean mobile number",
         )
     return canonical
+
+
+# Maximum length (in characters) of a batch-completion
+# webhook URL. The database column already enforces
+# ``<=500``; the service layer asserts the same value
+# eagerly so a request that would have failed at the INSERT
+# round-trip fails at the service boundary instead.
+_BATCH_WEBHOOK_URL_MAX_LENGTH = 500
+
+# Maximum length of a customer-supplied webhook signing
+# secret. 128 matches the same ceiling the
+# :class:`app.models.webhook.Webhook.secret` column uses.
+_BATCH_WEBHOOK_SECRET_MAX_LENGTH = 128
+
+
+def _validate_webhook_url(url: str) -> str:
+    """Return a clean ``https://`` URL or raise.
+
+    Mirrors the same scheme + length checks
+    :func:`app.services.webhooks._validate_url` applies to
+    the per-message delivery-receipt subscriptions so a
+    misconfigured customer cannot accidentally ship the
+    completion notification over the public internet in
+    clear text. The function is duplicated here (rather
+    than imported) to keep the dependency arrow pointing
+    from ``messaging`` -> ``webhooks`` one-way; a future
+    consolidation can lift the helper into a shared
+    ``validators`` module.
+    """
+    if not isinstance(url, str):
+        raise InvalidMessageError("invalid_webhook_url", "url must be a string")
+    cleaned = url.strip()
+    if not cleaned:
+        raise InvalidMessageError("invalid_webhook_url", "url is required")
+    if len(cleaned) > _BATCH_WEBHOOK_URL_MAX_LENGTH:
+        raise InvalidMessageError(
+            "invalid_webhook_url",
+            f"url must be at most {_BATCH_WEBHOOK_URL_MAX_LENGTH} characters",
+        )
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(cleaned)
+    except ValueError as exc:  # pragma: no cover - urlparse is permissive
+        raise InvalidMessageError("invalid_webhook_url", str(exc)) from exc
+    if parsed.scheme != "https":
+        raise InvalidMessageError(
+            "invalid_webhook_url",
+            "url must use the https scheme",
+        )
+    if not parsed.netloc:
+        raise InvalidMessageError(
+            "invalid_webhook_url", "url is missing the host"
+        )
+    return cleaned
+
+
+def _validate_webhook_secret(secret: str) -> str:
+    """Return the canonical webhook signing secret or raise.
+
+    Accepts any non-empty string up to the 128-character
+    column ceiling. The value is treated as opaque – we do
+    not impose a minimum entropy floor because the customer
+    might be using a deliberately long passphrase and we
+    do not want to second-guess the secret they chose.
+    """
+    if not isinstance(secret, str):
+        raise InvalidMessageError(
+            "invalid_webhook_secret", "secret must be a string"
+        )
+    cleaned = secret.strip()
+    if not cleaned:
+        raise InvalidMessageError(
+            "invalid_webhook_secret", "secret cannot be empty"
+        )
+    if len(cleaned) > _BATCH_WEBHOOK_SECRET_MAX_LENGTH:
+        raise InvalidMessageError(
+            "invalid_webhook_secret",
+            f"secret must be at most {_BATCH_WEBHOOK_SECRET_MAX_LENGTH} characters",
+        )
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +1046,8 @@ async def send_batch(
     items: list[dict[str, str]],
     settings: Settings | None = None,
     name: str | None = None,
+    webhook_url: str | None = None,
+    webhook_secret: str | None = None,
 ) -> BatchOutcome:
     """Persist + dispatch a batch of messages.
 
@@ -761,8 +1062,24 @@ async def send_batch(
     :class:`BatchOutcome` so the route layer can surface the
     ``batch_id`` in the response. A future iteration can swap
     the inline ``await`` for "persist with status=``pending``
-    and let the worker pick it up" without changing the
-    route handler.
+    and let the worker pick it up" without changing the route
+    handler.
+
+    ``webhook_url`` (optional, issue #9 acceptance criterion
+    "Webhook de batch completion funciona") is the
+    ``https://`` endpoint the platform POSTs a JSON summary
+    to once the batch reaches a terminal state. ``None``
+    disables the completion webhook – the customer can still
+    poll progress through :func:`get_batch` /
+    :func:`list_batches`.
+
+    ``webhook_secret`` is the HMAC-SHA256 key the platform
+    uses to sign the completion POST. When the caller omits
+    the value, the function mints a one-time secret (32 bytes
+    of CSPRNG entropy, hex-encoded) so the customer can
+    verify the body out-of-band; the generated value is
+    surfaced on the returned :class:`BatchOutcome` so the
+    route layer can echo it back to the caller.
 
     Cross-item isolation: a single bad item (``invalid_channel``
     / ``body_too_long`` …) raises before the loop runs, so the
@@ -801,6 +1118,28 @@ async def send_batch(
         except ValueError as exc:
             raise InvalidMessageError("invalid_channel", str(exc)) from exc
 
+    # Normalise the webhook configuration eagerly. We accept
+    # a missing URL (caller does not want a completion
+    # notification) but reject a URL that is not a
+    # well-formed ``https://`` endpoint, so a misconfigured
+    # customer cannot accidentally ship the secret to an
+    # ``http://`` listener or a typo'd ``javascript:`` URL.
+    canonical_webhook_url: str | None = None
+    canonical_webhook_secret: str | None = None
+    if webhook_url is not None and webhook_url != "":
+        canonical_webhook_url = _validate_webhook_url(webhook_url)
+        if webhook_secret is not None and webhook_secret != "":
+            canonical_webhook_secret = _validate_webhook_secret(webhook_secret)
+        else:
+            # Mint a one-time secret. 32 bytes of CSPRNG
+            # entropy (64 hex characters) matches the same
+            # ceiling the per-message
+            # :class:`app.models.webhook.Webhook` model
+            # uses for its signing key.
+            import secrets
+
+            canonical_webhook_secret = secrets.token_hex(32)
+
     # Create the Batch row up-front so every message can
     # carry its ``batch_id`` and the counters can be updated
     # in the same transaction. The ``total_count`` is frozen
@@ -814,6 +1153,8 @@ async def send_batch(
         delivered_count=0,
         failed_count=0,
         status=BatchStatus.PROCESSING,
+        webhook_url=canonical_webhook_url,
+        webhook_secret=canonical_webhook_secret,
     )
     session.add(batch)
     await session.flush()  # populate ``batch.id`` so messages can FK it
@@ -845,6 +1186,16 @@ async def send_batch(
     await session.commit()
     await session.refresh(batch)
 
+    # The per-channel breakdown is computed once the
+    # per-item status has settled so the response carries
+    # the same numbers the dashboard's "campañas" widget
+    # renders. The query is one indexed read on
+    # ``mensajes.batch_id`` (the same index the
+    # ``_recompute_batch_counters`` ``GROUP BY`` already
+    # uses) so the cost is bounded by the batch's hard
+    # cap (``_BATCH_HARD_LIMIT``).
+    channels = await _batch_channel_breakdown(session, batch_id=batch.id)
+
     return BatchOutcome(
         batch_id=batch.id,
         results=outcomes,
@@ -853,7 +1204,12 @@ async def send_batch(
             pending=batch.pending_count,
             delivered=batch.delivered_count,
             failed=batch.failed_count,
+            total_cost_clp=batch.total_cost_clp,
+            total_fee_clp=batch.total_fee_clp,
+            channels=channels,
         ),
+        webhook_url=canonical_webhook_url,
+        webhook_secret=canonical_webhook_secret,
     )
 
 
@@ -876,7 +1232,12 @@ async def _recompute_batch_counters(session: AsyncSession, *, batch: Batch) -> N
     inspecting the per-item counters.
     """
     stmt = (
-        select(Message.status, func.count(Message.id))
+        select(
+            Message.status,
+            func.count(Message.id),
+            func.coalesce(func.sum(Message.cost_clp), 0),
+            func.coalesce(func.sum(Message.fee_clp), 0),
+        )
         .where(Message.batch_id == batch.id)
         .group_by(Message.status)
     )
@@ -885,12 +1246,16 @@ async def _recompute_batch_counters(session: AsyncSession, *, batch: Batch) -> N
     pending = 0
     delivered = 0
     failed = 0
-    for raw_status, raw_count in rows:
+    total_cost = 0
+    total_fee = 0
+    for raw_status, raw_count, raw_cost, raw_fee in rows:
         # The ``MessageStatus`` column round-trips through
         # the ``_StringEnum`` decorator, so the row value
         # is either a :class:`MessageStatus` member or a
         # ``str`` (the SQLAlchemy core path). We accept both.
         count = int(raw_count or 0)
+        total_cost += int(raw_cost or 0)
+        total_fee += int(raw_fee or 0)
         if isinstance(raw_status, MessageStatus):
             status = raw_status
         else:
@@ -913,6 +1278,8 @@ async def _recompute_batch_counters(session: AsyncSession, *, batch: Batch) -> N
     batch.pending_count = pending
     batch.delivered_count = delivered
     batch.failed_count = failed
+    batch.total_cost_clp = total_cost
+    batch.total_fee_clp = total_fee
 
     # Status transition: ``completed`` once no item is in
     # flight; ``failed`` if every item ended up ``failed``
@@ -937,6 +1304,238 @@ async def _recompute_batch_counters(session: AsyncSession, *, batch: Batch) -> N
 
 
 # ---------------------------------------------------------------------------
+# Per-channel rollup
+# ---------------------------------------------------------------------------
+#
+# The dashboard's "Campañas" view renders the campaign's total
+# cost ("CLP $X") plus a per-channel breakdown ("SMS: 70
+# mensajes / CLP $2 450 · WhatsApp: 30 mensajes / CLP $2 550")
+# so a customer can tell at a glance which channel drove the
+# spend. The rollup is computed on demand from the underlying
+# ``mensajes`` table (the per-batch cost / fee columns on the
+# ``lotes`` row are only the totals) so the value is always
+# in sync with the latest delivery-receipt update – no separate
+# counter column is needed on the batch row.
+
+
+async def _batch_channel_breakdown(
+    session: AsyncSession,
+    *,
+    batch_id: str,
+) -> tuple[BatchChannelSummary, ...]:
+    """Return the per-channel rollup for a single batch.
+
+    The query mirrors the per-status recompute in
+    :func:`_recompute_batch_counters` but ``GROUP BY channel``
+    instead of ``status``. The result is a stable
+    ``(channel, count, …)`` projection the route layer
+    projects straight onto the response.
+
+    The function is intentionally narrow: a single
+    ``GROUP BY channel, status`` returns one row per
+    (channel, status) pair and the helper aggregates the
+    rows into the :class:`BatchChannelSummary` shape the
+    dashboard renders. The output is ordered by
+    ``channel.value`` so the response is stable across
+    calls (a future caller iterating the list does not
+    have to re-sort on the client).
+    """
+    if not batch_id:
+        return ()
+    stmt = (
+        select(
+            Message.channel,
+            Message.status,
+            func.count(Message.id),
+            func.coalesce(func.sum(Message.cost_clp), 0),
+            func.coalesce(func.sum(Message.fee_clp), 0),
+        )
+        .where(Message.batch_id == batch_id)
+        .group_by(Message.channel, Message.status)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    # Aggregate the per-(channel, status) rows into the
+    # per-channel rollup. ``pending`` is the union of
+    # ``pending`` / ``queued`` / ``sent`` / ``unknown``
+    # – same definition :func:`_recompute_batch_counters`
+    # uses for the batch-level rollup.
+    by_channel: dict[Channel, dict[str, int]] = {}
+    for raw_channel, raw_status, raw_count, raw_cost, raw_fee in rows:
+        count = int(raw_count or 0)
+        cost = int(raw_cost or 0)
+        fee = int(raw_fee or 0)
+        if isinstance(raw_channel, Channel):
+            channel = raw_channel
+        else:
+            try:
+                channel = Channel(str(raw_channel))
+            except ValueError:
+                # An unknown channel string is treated as a
+                # caller bug (the column is an enum, so this
+                # only happens on a manual DB edit) and is
+                # silently dropped to avoid breaking the
+                # response.
+                continue
+        if isinstance(raw_status, MessageStatus):
+            status = raw_status
+        else:
+            try:
+                status = MessageStatus(str(raw_status))
+            except ValueError:
+                status = MessageStatus.UNKNOWN
+        bucket = by_channel.setdefault(
+            channel,
+            {
+                "count": 0,
+                "pending": 0,
+                "delivered": 0,
+                "failed": 0,
+                "cost": 0,
+                "fee": 0,
+            },
+        )
+        bucket["count"] += count
+        bucket["cost"] += cost
+        bucket["fee"] += fee
+        if status == MessageStatus.DELIVERED:
+            bucket["delivered"] += count
+        elif status == MessageStatus.FAILED:
+            bucket["failed"] += count
+        else:
+            bucket["pending"] += count
+
+    return tuple(
+        BatchChannelSummary(
+            channel=channel,
+            count=bucket["count"],
+            pending=bucket["pending"],
+            delivered=bucket["delivered"],
+            failed=bucket["failed"],
+            total_cost_clp=bucket["cost"],
+            total_fee_clp=bucket["fee"],
+        )
+        for channel, bucket in sorted(by_channel.items(), key=lambda item: item[0].value)
+    )
+
+
+async def _batch_channel_breakdowns(
+    session: AsyncSession,
+    *,
+    batch_ids: Iterable[str],
+) -> dict[str, tuple[BatchChannelSummary, ...]]:
+    """Return the per-channel rollup for many batches in a single query.
+
+    The dashboard's listing endpoint (``GET
+    /v1/messages/batch``) renders a "Campañas" table where
+    every row needs the per-channel breakdown. Doing one
+    query per batch would be the textbook N+1 problem; this
+    helper issues a single ``GROUP BY batch_id, channel,
+    status`` and reassembles the per-batch slices in
+    Python. The cost is one indexed read on
+    ``mensajes.batch_id`` (the index the existing
+    ``_recompute_batch_counters`` already relies on) so the
+    listing endpoint stays single-round-trip.
+
+    Batches that have no messages yet (a freshly-created
+    batch that has not been flushed, or a batch whose items
+    were all rolled back) are not in the result – the route
+    layer is expected to render an empty ``channels``
+    array for those, the same shape the
+    :func:`_batch_channel_breakdown` helper returns for an
+    empty input.
+    """
+    ids = [str(value) for value in batch_ids if value]
+    if not ids:
+        return {}
+    stmt = (
+        select(
+            Message.batch_id,
+            Message.channel,
+            Message.status,
+            func.count(Message.id),
+            func.coalesce(func.sum(Message.cost_clp), 0),
+            func.coalesce(func.sum(Message.fee_clp), 0),
+        )
+        .where(Message.batch_id.in_(ids))
+        .group_by(Message.batch_id, Message.channel, Message.status)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    # ``accumulator`` is a ``{batch_id: {channel: bucket}}``
+    # double dict so the loop below can stay branchless. The
+    # outer dict is keyed by the batch id (the column we
+    # ``GROUP BY``-ed) and the inner dict is keyed by the
+    # :class:`Channel` (the per-batch rollup).
+    accumulator: dict[str, dict[Channel, dict[str, int]]] = {}
+    for raw_batch_id, raw_channel, raw_status, raw_count, raw_cost, raw_fee in rows:
+        if raw_batch_id is None:
+            # A message without a ``batch_id`` cannot be
+            # part of any batch – this is the single-message
+            # path (``POST /v1/messages``), which is not in
+            # the listing. Silently drop so a stray row does
+            # not break the response.
+            continue
+        batch_id = str(raw_batch_id)
+        count = int(raw_count or 0)
+        cost = int(raw_cost or 0)
+        fee = int(raw_fee or 0)
+        if isinstance(raw_channel, Channel):
+            channel = raw_channel
+        else:
+            try:
+                channel = Channel(str(raw_channel))
+            except ValueError:
+                continue
+        if isinstance(raw_status, MessageStatus):
+            status = raw_status
+        else:
+            try:
+                status = MessageStatus(str(raw_status))
+            except ValueError:
+                status = MessageStatus.UNKNOWN
+        per_batch = accumulator.setdefault(batch_id, {})
+        bucket = per_batch.setdefault(
+            channel,
+            {
+                "count": 0,
+                "pending": 0,
+                "delivered": 0,
+                "failed": 0,
+                "cost": 0,
+                "fee": 0,
+            },
+        )
+        bucket["count"] += count
+        bucket["cost"] += cost
+        bucket["fee"] += fee
+        if status == MessageStatus.DELIVERED:
+            bucket["delivered"] += count
+        elif status == MessageStatus.FAILED:
+            bucket["failed"] += count
+        else:
+            bucket["pending"] += count
+
+    return {
+        batch_id: tuple(
+            BatchChannelSummary(
+                channel=channel,
+                count=bucket["count"],
+                pending=bucket["pending"],
+                delivered=bucket["delivered"],
+                failed=bucket["failed"],
+                total_cost_clp=bucket["cost"],
+                total_fee_clp=bucket["fee"],
+            )
+            for channel, bucket in sorted(
+                per_channel.items(), key=lambda item: item[0].value
+            )
+        )
+        for batch_id, per_channel in accumulator.items()
+    }
+
+
+# ---------------------------------------------------------------------------
 # Batch lookup
 # ---------------------------------------------------------------------------
 
@@ -947,9 +1546,10 @@ async def get_batch(
     client: Client,
     batch_id: str,
     settings: Settings | None = None,
-) -> Batch:
-    """Return a single :class:`Batch` row, recomputing its
-    counters on the way out.
+) -> BatchDetail:
+    """Return a single :class:`Batch` row together with its
+    per-channel rollup, recomputing the counters on the
+    way out.
 
     The cross-tenant access guard reports an unknown id the
     same way :func:`get_message_status` does: a batch that
@@ -963,6 +1563,12 @@ async def get_batch(
     delivery receipts asynchronously through the webhook
     loop still shows up-to-date numbers when the customer
     opens the dashboard.
+
+    The return type is a :class:`BatchDetail` (a tuple of
+    the batch row and its per-channel rollup) rather than
+    a bare :class:`Batch` so the route layer does not have
+    to issue a second query to fetch the per-channel
+    breakdown the dashboard's "Campañas" view needs.
     """
     _ = settings  # kept for symmetry with the rest of the service
     if not isinstance(batch_id, str) or not batch_id:
@@ -985,7 +1591,13 @@ async def get_batch(
         # the SQL we just ran.
         await session.commit()
     await session.refresh(batch)
-    return batch
+    # The per-channel breakdown is computed once the
+    # per-item status has settled (i.e. after the recompute
+    # above) so the response carries the same numbers the
+    # dashboard renders. The query is a single indexed
+    # read on ``mensajes.batch_id``.
+    channels = await _batch_channel_breakdown(session, batch_id=batch.id)
+    return BatchDetail(batch=batch, channels=channels)
 
 
 async def list_batches(
@@ -1036,12 +1648,29 @@ async def list_batches(
     total = int(count_result.scalar_one() or 0)
     has_more = (offset + len(items)) < total
 
+    # Per-channel rollup for the page: a single
+    # ``GROUP BY batch_id, channel, status`` over the
+    # returned batch ids. Issuing one round-trip per
+    # batch would be the textbook N+1 trap, so we
+    # batch the query here and return a ``batch_id ->
+    # channels`` map the route layer iterates alongside
+    # ``items``. Batches with no messages (a freshly
+    # created batch that has not been flushed yet, or a
+    # batch whose items were all rolled back) are not in
+    # the map; the route layer is expected to render an
+    # empty ``channels`` list for those.
+    batch_ids = [batch.id for batch in items]
+    channels_by_batch = await _batch_channel_breakdowns(
+        session, batch_ids=batch_ids
+    )
+
     return BatchListPage(
         items=items,
         total=total,
         limit=limit,
         offset=offset,
         has_more=has_more,
+        channels_by_batch=channels_by_batch,
     )
 
 
@@ -1879,11 +2508,11 @@ async def message_status_summary(
 def _coerce_day(value: object) -> date:
     """Normalise a ``GROUP BY date(...)`` result to a :class:`date`.
 
-    SQLite (the test backend) returns the truncated value as
-    a string; PostgreSQL (the production backend) returns a
-    real :class:`datetime.date`. The function is the single
-    point of normalisation so the route layer can rely on a
-    stable type regardless of the active database engine.
+    SQLite (the test backend) returns the truncated value as a
+    string; PostgreSQL (the production backend) returns a real
+    :class:`datetime.date`. The function is the single point of
+    normalisation so the route layer can rely on a stable type
+    regardless of the active database engine.
     """
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
@@ -1903,10 +2532,193 @@ def _coerce_day(value: object) -> date:
     )
 
 
+# ---------------------------------------------------------------------------
+# Batch completion webhook (issue #9)
+# ---------------------------------------------------------------------------
+#
+# The PRD's batch-completion notification is opt-in: a
+# customer that wants a "your campaign finished" push
+# registers a ``webhook_url`` on the ``POST /v1/messages/batch``
+# request and the platform fires one signed POST once the
+# batch reaches a terminal state (``completed`` or
+# ``failed``).
+#
+# The notification piggybacks on the same
+# :class:`~app.services.webhook_delivery.WebhookDeliveryClient`
+# the per-message receipts use, so the retry / timeout knobs
+# are owned by :class:`Settings` and a flaky customer
+# endpoint cannot consume the worker's quota indefinitely.
+# The signing key is the one-time ``webhook_secret`` the
+# :func:`send_batch` call minted (or the customer-supplied
+# value) so the receiver can verify the body out-of-band.
+
+
+# Event name the platform advertises on the completion
+# POST. Mirrors the same dotted-lowercase convention the
+# per-message ``WebhookEvent`` values use so a single
+# receiver-side switch statement can branch on the
+# ``X-Mgw-Event`` header.
+_BATCH_COMPLETED_EVENT = "batch.completed"
+
+# Header names the delivery helper sets on the outbound
+# completion POST. Mirrors the values
+# :mod:`app.services.webhooks` exposes for the per-message
+# receipts so a receiver that already speaks the per-message
+# protocol does not have to add a second branch for the
+# batch events.
+_BATCH_SIGNATURE_HEADER = "X-Mgw-Signature"
+_BATCH_EVENT_HEADER = "X-Mgw-Event"
+_BATCH_DELIVERY_ID_HEADER = "X-Mgw-Delivery"
+
+
+def _build_completion_payload(
+    *,
+    batch: Batch,
+    summary: BatchSummary,
+) -> dict[str, object]:
+    """Project a finished :class:`Batch` row onto the JSON
+    the delivery helper POSTs to the customer's endpoint.
+
+    The shape is intentionally compact: only the fields a
+    backend system needs to update its own record of the
+    campaign (status, counters, totals). The full batch
+    row stays on the platform side; the receiver can always
+    poll ``GET /v1/messages/batch/{batch_id}`` for the
+    canonical state.
+    """
+    channels = [
+        {
+            "channel": (
+                channel.channel.value
+                if hasattr(channel.channel, "value")
+                else str(channel.channel)
+            ),
+            "count": channel.count,
+            "pending": channel.pending,
+            "delivered": channel.delivered,
+            "failed": channel.failed,
+            "succeeded": channel.succeeded,
+            "total_cost_clp": channel.total_cost_clp,
+            "total_fee_clp": channel.total_fee_clp,
+            "total_amount_clp": channel.total_amount_clp,
+        }
+        for channel in summary.channels
+    ]
+    completed_at = batch.completed_at
+    status_value = (
+        batch.status.value
+        if hasattr(batch.status, "value")
+        else str(batch.status)
+    )
+    return {
+        "id": batch.id,
+        "client_id": batch.client_id,
+        "name": batch.name,
+        "status": status_value,
+        "total": summary.total,
+        "pending": summary.pending,
+        "delivered": summary.delivered,
+        "failed": summary.failed,
+        "succeeded": summary.succeeded,
+        "total_cost_clp": summary.total_cost_clp,
+        "total_fee_clp": summary.total_fee_clp,
+        "total_amount_clp": summary.total_amount_clp,
+        "channels": channels,
+        "created_at": batch.created_at.isoformat() if batch.created_at else None,
+        "completed_at": completed_at.isoformat() if completed_at else None,
+    }
+
+
+async def fire_batch_completion_webhook(
+    *,
+    batch: Batch,
+    summary: BatchSummary,
+    settings: Settings | None = None,
+    delivery_client: _WebhookDeliveryLike | None = None,
+) -> WebhookDeliveryResult | None:
+    """POST the batch-completion summary to the customer's
+    ``webhook_url`` and return the per-call outcome.
+
+    Returns ``None`` when the batch was not configured with
+    a completion webhook (the common case for customers
+    who only ever poll ``GET /v1/messages/batch/{id}``).
+    The function never raises on a transport error – a
+    failing customer endpoint must not crash the caller
+    (the route layer wires this through
+    :class:`fastapi.BackgroundTasks`, so a raised
+    exception would only show up in the server log
+    without any way for the customer to see it).
+
+    The signing scheme mirrors the per-message
+    :func:`app.services.webhooks.sign_payload` contract:
+    HMAC-SHA256 over the JSON body, with the
+    one-time ``webhook_secret`` the
+    :func:`send_batch` call minted (or the
+    customer-supplied value) as the key. The digest is
+    carried in the ``X-Mgw-Signature`` header so the
+    receiver can verify the body before parsing it.
+
+    ``delivery_client`` is an injectable seam so unit
+    tests can swap the in-memory fake
+    :class:`FakeWebhookDeliveryClient` in without
+    monkeypatching the production
+    :class:`WebhookDeliveryClient`.
+    """
+    if not batch.webhook_url:
+        return None
+    cfg = settings or get_settings()
+    # ``batch.webhook_secret`` was populated by
+    # :func:`send_batch` (either from the caller or
+    # minted as a one-time value). A ``None`` at this
+    # point is a database corruption – the row claims
+    # to have a webhook but the secret is missing. We
+    # log the anomaly and skip the POST rather than
+    # fire an unsigned request the receiver cannot
+    # verify.
+    if not batch.webhook_secret:
+        logger = get_logger(__name__)
+        logger.warning(
+            "batch_webhook_missing_secret",
+            extra={"batch_id": batch.id, "client_id": batch.client_id},
+        )
+        return None
+
+    # Local import keeps the top-of-file import block
+    # free of the ``httpx``-based delivery client and
+    # avoids a circular dependency with the webhooks
+    # module.
+    import json as _json
+
+    from app.services.webhook_delivery import (
+        WebhookDeliveryClient,
+    )
+    from app.services.webhooks import sign_payload
+
+    payload = _build_completion_payload(batch=batch, summary=summary)
+    body = _json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    client = delivery_client or WebhookDeliveryClient(
+        timeout_seconds=cfg.batch_webhook_timeout_seconds,
+        max_attempts=cfg.batch_webhook_max_delivery_attempts,
+    )
+    signature = sign_payload(body=body, secret=batch.webhook_secret)
+    delivery = await client.deliver(
+        url=batch.webhook_url,
+        body=body,
+        headers={
+            _BATCH_SIGNATURE_HEADER: signature,
+            _BATCH_EVENT_HEADER: _BATCH_COMPLETED_EVENT,
+            _BATCH_DELIVERY_ID_HEADER: batch.id,
+            "Content-Type": "application/json",
+        },
+    )
+    return delivery
+
+
 __all__ = (
     "BatchListPage",
     "BatchNotFoundError",
     "BatchOutcome",
+    "BatchRateLimitError",
     "BatchSummary",
     "BatchTooLargeError",
     "DEFAULT_BATCH_SIZE",
@@ -1924,6 +2736,7 @@ __all__ = (
     "SendOutcome",
     "compute_message_cost",
     "daily_message_counts",
+    "fire_batch_completion_webhook",
     "get_batch",
     "get_message_status",
     "iter_messages_for_export",

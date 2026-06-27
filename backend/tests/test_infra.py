@@ -252,6 +252,10 @@ EXPECTED_ENV_KEYS: set[str] = {
     # Webhooks – delivery receipts (issue #5).
     "WEBHOOK_DELIVERY_TIMEOUT_SECONDS",
     "WEBHOOK_MAX_DELIVERY_ATTEMPTS",
+    # Batch messaging (issue #9) – rate limit + completion webhook.
+    "BATCH_RATE_LIMIT_PER_SECOND",
+    "BATCH_WEBHOOK_TIMEOUT_SECONDS",
+    "BATCH_WEBHOOK_MAX_DELIVERY_ATTEMPTS",
     # Billing & Flow (issue #7).
     "BILLING_CURRENCY",
     "BILLING_IVA_RATE",

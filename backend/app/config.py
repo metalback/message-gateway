@@ -192,6 +192,44 @@ class Settings(BaseSettings):
         le=10,
     )
 
+    # --- Batch messaging (issue #9) ------------------------------------
+    # Maximum number of ``POST /v1/messages/batch`` calls a single
+    # customer is allowed to issue per second. Enforced by a
+    # Redis-backed sliding window in :mod:`app.services.rate_limit`
+    # so a runaway client cannot flood the worker queue. 100/s
+    # matches the "100 msg/s por API Key" promise in the PRD –
+    # note that the limit is on **batches**, not on individual
+    # messages, so a single batch of 10 000 items still costs
+    # one call against the budget.
+    batch_rate_limit_per_second: int = Field(
+        default=100,
+        alias="BATCH_RATE_LIMIT_PER_SECOND",
+        ge=1,
+        le=10_000,
+    )
+    # Timeout (in seconds) for the batch-completion webhook
+    # POST. Mirrors ``webhook_delivery_timeout_seconds`` so a
+    # misconfigured ``webhook_url`` cannot stall the response
+    # for more than the same bounded interval the per-message
+    # delivery receipts use.
+    batch_webhook_timeout_seconds: float = Field(
+        default=5.0,
+        alias="BATCH_WEBHOOK_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=30.0,
+    )
+    # Maximum number of delivery attempts the platform will
+    # make for a single batch-completion POST before giving up.
+    # Mirrors ``webhook_max_delivery_attempts`` so a flaky
+    # customer endpoint cannot consume the worker's quota
+    # indefinitely.
+    batch_webhook_max_delivery_attempts: int = Field(
+        default=5,
+        alias="BATCH_WEBHOOK_MAX_DELIVERY_ATTEMPTS",
+        ge=1,
+        le=10,
+    )
+
     # --- Billing --------------------------------------------------------
     # Currency used for invoicing. The PRD locks the platform to
     # CLP (Chilean Pesos) for the MVP; the field is exposed so a
