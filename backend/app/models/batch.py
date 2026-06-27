@@ -20,14 +20,27 @@ The shape mirrors the ``lotes`` table documented in the PRD
                          label.
 - ``total_count``      – number of items the caller submitted.
                          Frozen at creation time so the dashboard
-                         can render "X of Y delivered" without
-                         having to re-derive the denominator.
+                         can render "X of Y" without having to
+                         re-derive the denominator.
 - ``pending_count``    – items still in ``pending`` /
                          ``queued`` / ``sent`` state. Always
                          ``>= 0``; recomputed on every
                          :func:`update_counters` call.
 - ``delivered_count``  – items in ``delivered`` state.
 - ``failed_count``     – items in ``failed`` state.
+- ``total_cost_clp``   – aggregated upstream cost (CLP cents)
+                         across every message in the batch.
+                         Recomputed on every
+                         :func:`update_counters` call so the
+                         dashboard's "Campañas" view can render
+                         the campaign's total cost without
+                         re-aggregating the underlying
+                         ``mensajes`` table.
+- ``total_fee_clp``    – aggregated platform markup (CLP cents)
+                         across every message in the batch.
+                         Sum of ``cost_clp + fee_clp`` is the
+                         amount the customer is billed for the
+                         campaign.
 - ``status``           – batch-level lifecycle
                          (``processing`` / ``completed`` /
                          ``failed``). ``processing`` while at
@@ -182,6 +195,43 @@ class Batch(Base):
     # Items in ``failed`` state.
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # --- Cost rollup -----------------------------------------------------
+    # Aggregated cost / fee (in CLP cents) across every message of the
+    # batch. Mirrors the ``cost_clp`` / ``fee_clp`` columns on
+    # :class:`app.models.message.Message` and is recomputed by
+    # :func:`app.services.messaging._recompute_batch_counters` so the
+    # dashboard's "Campañas" view can render the campaign's total cost
+    # without re-aggregating the underlying ``mensajes`` table.
+    # ``0`` for a freshly-created batch (the rollup runs once the
+    # provider has accepted the first item).
+    total_cost_clp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_fee_clp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- Completion webhook (issue #9) -----------------------------------
+    # ``webhook_url`` is the optional ``https://`` endpoint the
+    # platform POSTs a JSON summary to when the batch transitions
+    # to a terminal state (``completed`` / ``failed``). ``None`` for
+    # the legacy code path that only polls through
+    # ``GET /v1/messages/batch/{id}``; the platform treats a
+    # missing value as "no webhook configured" and silently skips
+    # the completion POST.
+    #
+    # ``webhook_secret`` is the HMAC-SHA256 key the platform uses
+    # to sign the completion POST. When the caller of
+    # ``POST /v1/messages/batch`` omits the value, the service
+    # layer mints a one-time secret (32 bytes of CSPRNG entropy,
+    # hex-encoded) and surfaces it in the response – the same
+    # flow the API-key onboarding uses. The column is the
+    # canonical record of the secret so a future re-fire does
+    # not need to mint a second one.
+    #
+    # Both columns are nullable. The completion webhook is
+    # strictly opt-in: a customer who only ever polls
+    # ``GET /v1/messages/batch/{id}`` never sees the columns
+    # populated.
+    webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    webhook_secret: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     # --- Lifecycle -------------------------------------------------------
     # Batch-level lifecycle. ``processing`` while at least one
     # item is still in flight; ``completed`` when every item has
@@ -212,6 +262,12 @@ class Batch(Base):
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
+        # ``webhook_secret`` is intentionally absent from the
+        # repr so a copy-paste of the debug output never leaks
+        # the HMAC key the platform uses to sign completion
+        # webhooks. The same rule the
+        # :class:`app.models.webhook.Webhook` model already
+        # follows for the per-message delivery receipts.
         return (
             f"Batch(id={self.id!r}, client_id={self.client_id!r}, "
             f"status={self.status!r}, total={self.total_count!r})"
