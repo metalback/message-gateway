@@ -16,6 +16,7 @@ import {
   InvoiceRow,
   MessageListResponse,
   MessageRow,
+  StatusSummaryResponse,
 } from '../../models/usage-dashboard.types';
 
 /**
@@ -62,6 +63,27 @@ const SAMPLE_DAILY: DailyUsageResponse = {
     { day: '2026-06-15', channel: 'sms', count: 2 },
     { day: '2026-06-15', channel: 'whatsapp', count: 3 },
   ],
+};
+
+/** A canned status-summary payload for the breakdown card tests. */
+const SAMPLE_STATUS_SUMMARY: StatusSummaryResponse = {
+  since: '2026-05-16T00:00:00+00:00',
+  until: '2026-06-15T00:00:00+00:00',
+  items: [
+    { status: 'delivered', count: 7 },
+    { status: 'sent', count: 2 },
+    { status: 'queued', count: 0 },
+    { status: 'pending', count: 1 },
+    { status: 'failed', count: 1 },
+    { status: 'unknown', count: 0 },
+  ],
+  total: 11,
+  delivered: 7,
+  failed: 1,
+  pending: 1,
+  cost_clp: 275,
+  fee_clp: 35,
+  delivery_rate: 7 / 11,
 };
 
 /** A canned invoice list for the invoice table tests. */
@@ -161,6 +183,9 @@ describe('UsageDashboardComponent', () => {
     http.expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`).flush(
       SAMPLE_DAILY,
     );
+    http.expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`).flush(
+      SAMPLE_STATUS_SUMMARY,
+    );
     http.expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`).flush(
       SAMPLE_INVOICES,
     );
@@ -198,6 +223,12 @@ describe('UsageDashboardComponent', () => {
       );
     http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
+      .flush(
+        { detail: { code: 'missing_api_key', message: 'X-API-Key required' } },
+        { status: 401, statusText: 'Unauthorized' },
+      );
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
       .flush(
         { detail: { code: 'missing_api_key', message: 'X-API-Key required' } },
         { status: 401, statusText: 'Unauthorized' },
@@ -304,6 +335,27 @@ describe('UsageDashboardComponent', () => {
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
       .flush({ since: '2026-06-14T00:00:00+00:00', until: '2026-06-15T00:00:00+00:00', items: [] });
     http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
+      .flush({
+        since: '2026-05-16T00:00:00+00:00',
+        until: '2026-06-15T00:00:00+00:00',
+        items: [
+          { status: 'delivered', count: 0 },
+          { status: 'sent', count: 0 },
+          { status: 'queued', count: 0 },
+          { status: 'pending', count: 0 },
+          { status: 'failed', count: 0 },
+          { status: 'unknown', count: 0 },
+        ],
+        total: 0,
+        delivered: 0,
+        failed: 0,
+        pending: 0,
+        cost_clp: 0,
+        fee_clp: 0,
+        delivery_rate: 0,
+      });
+    http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`)
       .flush([]);
     fixture.detectChanges();
@@ -355,12 +407,15 @@ describe('UsageDashboardComponent', () => {
         { detail: { code: 'rate_limited', message: 'too many' } },
         { status: 429, statusText: 'Too Many Requests' },
       );
-    // The remaining two parallel requests are still
+    // The remaining three parallel requests are still
     // outstanding; flush them so the test does not leak
     // requests into the next test.
     http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
       .flush(SAMPLE_DAILY);
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
+      .flush(SAMPLE_STATUS_SUMMARY);
     http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`)
       .flush(SAMPLE_INVOICES);
@@ -406,6 +461,27 @@ describe('UsageDashboardComponent', () => {
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
       .flush({ since: '2026-06-14T00:00:00+00:00', until: '2026-06-15T00:00:00+00:00', items: [] });
     http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
+      .flush({
+        since: '2026-05-16T00:00:00+00:00',
+        until: '2026-06-15T00:00:00+00:00',
+        items: [
+          { status: 'delivered', count: 0 },
+          { status: 'sent', count: 0 },
+          { status: 'queued', count: 0 },
+          { status: 'pending', count: 0 },
+          { status: 'failed', count: 0 },
+          { status: 'unknown', count: 0 },
+        ],
+        total: 0,
+        delivered: 0,
+        failed: 0,
+        pending: 0,
+        cost_clp: 0,
+        fee_clp: 0,
+        delivery_rate: 0,
+      });
+    http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`)
       .flush([]);
     fixture.detectChanges();
@@ -444,6 +520,27 @@ describe('UsageDashboardComponent', () => {
     http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
       .flush({ since: '2026-06-14T00:00:00+00:00', until: '2026-06-15T00:00:00+00:00', items: [] });
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
+      .flush({
+        since: '2026-05-16T00:00:00+00:00',
+        until: '2026-06-15T00:00:00+00:00',
+        items: [
+          { status: 'delivered', count: 0 },
+          { status: 'sent', count: 0 },
+          { status: 'queued', count: 0 },
+          { status: 'pending', count: 0 },
+          { status: 'failed', count: 0 },
+          { status: 'unknown', count: 0 },
+        ],
+        total: 0,
+        delivered: 0,
+        failed: 0,
+        pending: 0,
+        cost_clp: 0,
+        fee_clp: 0,
+        delivery_rate: 0,
+      });
     http
       .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`)
       .flush([]);
@@ -565,6 +662,133 @@ describe('UsageDashboardComponent', () => {
     exportReq.flush(new Blob([''], { type: 'text/csv' }));
     fixture.detectChanges();
   });
+
+  it('renders the status summary card with the per-status breakdown on init', () => {
+    // The "desglose por estado" card is wired to the new
+    // ``/v1/messages/summary`` endpoint. The test seeds a
+    // known summary payload, flushes the parallel
+    // ``forkJoin`` and asserts the rendered DOM carries
+    // the per-status rows plus the delivery-rate badge
+    // and the cost summary footer.
+    const fixture = TestBed.createComponent(UsageDashboardComponent);
+    fixture.detectChanges();
+    flushInitial();
+    fixture.detectChanges();
+
+    const card = fixture.nativeElement.querySelector(
+      '[data-testid="status-summary-card"]',
+    );
+    expect(card).not.toBeNull();
+    // The total counter is rendered in the header.
+    const total = fixture.nativeElement.querySelector(
+      '[data-testid="status-summary-total"]',
+    );
+    expect(total?.textContent).toContain('11');
+    // The breakdown list renders one row per status from
+    // the response (the backend zero-fills missing
+    // statuses, so the dashboard always gets six rows).
+    const rows = fixture.nativeElement.querySelectorAll(
+      '[data-testid="status-summary-bars"] dt',
+    );
+    expect(rows.length).toBe(6);
+  });
+
+  it('clamps the delivery-rate progress bar to [0, 100] and formats it as a percentage', () => {
+    // The component renders a Tailwind-only progress bar
+    // whose width is ``delivery_rate * 100``, clamped to
+    // the closed interval ``[0, 100]`` so a future
+    // regression that returns a value outside the
+    // documented range does not produce a negative or
+    // oversized bar.
+    const fixture = TestBed.createComponent(UsageDashboardComponent);
+    const component = fixture.componentInstance;
+    // 7/11 → 0.6364 → 64%.
+    expect(component.statusSummaryDeliveryPercent(SAMPLE_STATUS_SUMMARY)).toBe(64);
+    expect(component.statusSummaryDeliveryWidth(SAMPLE_STATUS_SUMMARY)).toBe(64);
+    // An empty summary produces a 0% bar (no
+    // divide-by-zero).
+    const empty: StatusSummaryResponse = {
+      ...SAMPLE_STATUS_SUMMARY,
+      total: 0,
+      delivered: 0,
+      delivery_rate: 0,
+    };
+    expect(component.statusSummaryDeliveryPercent(empty)).toBe(0);
+    expect(component.statusSummaryDeliveryWidth(empty)).toBe(0);
+  });
+
+  it('computes the average cost per message in the active window', () => {
+    // The "Promedio por mensaje" footer of the card is
+    // ``cost_clp / total``, rounded to an integer. The
+    // component guards against a divide-by-zero for an
+    // empty summary.
+    const fixture = TestBed.createComponent(UsageDashboardComponent);
+    const component = fixture.componentInstance;
+    // 275 / 11 = 25 (rounded).
+    expect(component.statusSummaryAverageCost(SAMPLE_STATUS_SUMMARY)).toBe(25);
+    // Empty summary: zero, not NaN.
+    const empty: StatusSummaryResponse = {
+      ...SAMPLE_STATUS_SUMMARY,
+      total: 0,
+      cost_clp: 0,
+    };
+    expect(component.statusSummaryAverageCost(empty)).toBe(0);
+  });
+
+  it('renders the status-summary empty-state when the customer has no traffic', () => {
+    // An empty summary (every status row has a count of
+    // zero) renders the "todavía no has enviado mensajes"
+    // empty state and hides the delivery-rate bar and the
+    // cost summary footer.
+    const fixture = TestBed.createComponent(UsageDashboardComponent);
+    fixture.detectChanges();
+    http
+      .expectOne(`${environment.apiBaseUrl}/v1/billing/balance`)
+      .flush(SAMPLE_BALANCE);
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages`)
+      .flush(pageResponse([]));
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`)
+      .flush({ since: '2026-06-14T00:00:00+00:00', until: '2026-06-15T00:00:00+00:00', items: [] });
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`)
+      .flush({
+        since: '2026-05-16T00:00:00+00:00',
+        until: '2026-06-15T00:00:00+00:00',
+        items: [
+          { status: 'delivered', count: 0 },
+          { status: 'sent', count: 0 },
+          { status: 'queued', count: 0 },
+          { status: 'pending', count: 0 },
+          { status: 'failed', count: 0 },
+          { status: 'unknown', count: 0 },
+        ],
+        total: 0,
+        delivered: 0,
+        failed: 0,
+        pending: 0,
+        cost_clp: 0,
+        fee_clp: 0,
+        delivery_rate: 0,
+      });
+    http
+      .expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/billing/invoices`)
+      .flush([]);
+    fixture.detectChanges();
+
+    const empty = fixture.nativeElement.querySelector(
+      '[data-testid="status-summary-empty"]',
+    );
+    expect(empty).not.toBeNull();
+    // The breakdown list is hidden when the summary is
+    // empty (the customer has not produced any traffic
+    // yet).
+    const bars = fixture.nativeElement.querySelector(
+      '[data-testid="status-summary-bars"]',
+    );
+    expect(bars).toBeNull();
+  });
 });
 
 /**
@@ -645,6 +869,10 @@ describe('UsageDashboardComponent (error rendering)', () => {
       { status: 500, statusText: 'Internal Server Error' },
     );
     http.expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/daily`).flush(
+      { detail: { code: 'unknown', message: 'oops' } },
+      { status: 500, statusText: 'Internal Server Error' },
+    );
+    http.expectOne((r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`).flush(
       { detail: { code: 'unknown', message: 'oops' } },
       { status: 500, statusText: 'Internal Server Error' },
     );

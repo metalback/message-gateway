@@ -107,6 +107,45 @@ export interface DailyUsageFilters {
 }
 
 /**
+ * A single ``(status, count)`` row in the status-summary
+ * response (``GET /v1/messages/summary``).
+ *
+ * The dashboard uses the value to drive the "desglose por
+ * estado" card that sits above the history table (PRD
+ * user story #13: "ver el historial de mensajes enviados
+ * con sus estados, para debugging"). The backend
+ * zero-fills every status the customer has not produced
+ * so the response always carries one row per
+ * :class:`MessageStatus` value.
+ */
+export interface StatusSummaryBucket {
+  readonly status: MessageStatus;
+  readonly count: number;
+}
+
+/** Filters for the status-summary endpoint. */
+export interface StatusSummaryFilters {
+  channel?: MessageChannel | null;
+  since?: string | null;
+  until?: string | null;
+}
+
+/** The full ``GET /v1/messages/summary`` response. */
+export interface StatusSummaryResponse {
+  readonly items: ReadonlyArray<StatusSummaryBucket>;
+  readonly total: number;
+  readonly delivered: number;
+  readonly failed: number;
+  readonly pending: number;
+  readonly cost_clp: number;
+  readonly fee_clp: number;
+  /** Fraction of messages in the ``delivered`` state, in ``[0.0, 1.0]``. */
+  readonly delivery_rate: number;
+  readonly since: string;
+  readonly until: string;
+}
+
+/**
  * Lifecycle status of an :class:`Invoice` row, mirroring
  * the backend enum. The dashboard only displays the
  * values; the route layer is the only writer.

@@ -66,6 +66,114 @@
     </div>
   </ng-template>
 
+  <!-- Status summary card -->
+  <article
+    *ngIf="statusSummary as summary; else statusSummarySkeleton"
+    class="mb-8 rounded-lg border border-slate-200 bg-white p-6 shadow-sm"
+    data-testid="status-summary-card"
+  >
+    <header class="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+      <div>
+        <h2 class="text-sm font-medium uppercase tracking-wide text-slate-500">
+          Desglose por estado
+        </h2>
+        <p class="mt-1 text-xs text-slate-500">
+          <ng-container *ngIf="statusSummarySince && statusSummaryUntil; else statusSummaryDefault">
+            Período {{ formatDay(statusSummarySince) }} – {{ formatDay(statusSummaryUntil) }}
+          </ng-container>
+          <ng-template #statusSummaryDefault>
+            Cargando…
+          </ng-template>
+        </p>
+      </div>
+      <p class="text-xs text-slate-500" data-testid="status-summary-total">
+        Total: {{ summary.total | number }} mensajes
+      </p>
+    </header>
+
+    <!-- Delivery rate progress bar -->
+    <div
+      *ngIf="summary.total > 0; else statusSummaryEmpty"
+      class="mb-5"
+      data-testid="status-summary-delivery"
+    >
+      <div class="mb-1 flex items-baseline justify-between text-xs">
+        <span class="font-medium text-slate-600">Tasa de entrega</span>
+        <span class="font-semibold text-emerald-700">
+          {{ statusSummaryDeliveryPercent(summary) }}%
+        </span>
+      </div>
+      <div class="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+        <div
+          class="h-full rounded-full bg-emerald-500"
+          [style.width.%]="statusSummaryDeliveryWidth(summary)"
+          data-testid="status-summary-delivery-bar"
+        ></div>
+      </div>
+    </div>
+
+    <ng-template #statusSummaryEmpty>
+      <div
+        class="mb-5 rounded-md border border-dashed border-slate-300 bg-slate-50 p-3 text-xs text-slate-500"
+        data-testid="status-summary-empty"
+      >
+        Aún no has enviado mensajes este período.
+      </div>
+    </ng-template>
+
+    <!-- Per-status breakdown -->
+    <dl
+      *ngIf="summary.total > 0"
+      class="grid grid-cols-2 gap-x-8 gap-y-2 text-sm sm:grid-cols-3"
+      data-testid="status-summary-bars"
+    >
+      <ng-container *ngFor="let row of summary.items; trackBy: trackStatusSummary">
+        <dt class="text-slate-500">
+          <span
+            class="mr-1 inline-block h-2 w-2 rounded-full align-middle"
+            [ngClass]="statusSummaryDotClass(row.status)"
+          ></span>
+          {{ statusSummaryStatusLabel(row.status) }}
+        </dt>
+        <dd class="text-right font-medium text-slate-900">
+          {{ row.count | number }}
+          <span class="text-xs font-normal text-slate-500">
+            ({{ statusSummaryPercent(row.count, summary.total) }}%)
+          </span>
+        </dd>
+      </ng-container>
+    </dl>
+
+    <!-- Cost summary footer -->
+    <footer
+      *ngIf="summary.total > 0"
+      class="mt-5 flex flex-wrap items-baseline justify-between gap-2 border-t border-slate-100 pt-4 text-xs text-slate-500"
+    >
+      <span>
+        Costo total del período:
+        <strong class="text-slate-700">${{ summary.cost_clp | number }}</strong>
+        · Markup:
+        <strong class="text-slate-700">${{ summary.fee_clp | number }}</strong>
+      </span>
+      <span>
+        Promedio por mensaje:
+        <strong class="text-slate-700">
+          ${{ statusSummaryAverageCost(summary) | number }}
+        </strong>
+      </span>
+    </footer>
+  </article>
+
+  <ng-template #statusSummarySkeleton>
+    <div
+      *ngIf="initialLoadDone"
+      class="mb-8 rounded-lg border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-500"
+      data-testid="status-summary-card-missing"
+    >
+      No se pudo cargar el desglose por estado. Vuelve a intentar más tarde.
+    </div>
+  </ng-template>
+
   <!-- Daily usage chart -->
   <article
     class="mb-8 rounded-lg border border-slate-200 bg-white p-6 shadow-sm"

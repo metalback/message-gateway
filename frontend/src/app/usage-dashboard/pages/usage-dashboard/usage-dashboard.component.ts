@@ -15,6 +15,8 @@ import {
   MessageListResponse,
   MessageRow,
   MessageStatus,
+  StatusSummaryBucket,
+  StatusSummaryResponse,
 } from '../../models/usage-dashboard.types';
 
 /**
@@ -80,6 +82,21 @@ export class UsageDashboardComponent implements OnInit, OnDestroy {
 
   /** Resolved ``until`` the daily endpoint picked. */
   dailyUntil: string | null = null;
+
+  /**
+   * Per-status message counts the "desglose por estado"
+   * card renders. The component holds the full
+   * :class:`StatusSummaryResponse` so the template can
+   * reach the headline counters and the cost / fee
+   * totals without a second round-trip.
+   */
+  statusSummary: StatusSummaryResponse | null = null;
+
+  /** Resolved ``since`` the status-summary endpoint picked. */
+  statusSummarySince: string | null = null;
+
+  /** Resolved ``until`` the status-summary endpoint picked. */
+  statusSummaryUntil: string | null = null;
 
   /** Invoice history, newest first. */
   invoices: ReadonlyArray<InvoiceRow> = [];
@@ -176,14 +193,16 @@ export class UsageDashboardComponent implements OnInit, OnDestroy {
       balance: this.service.getBalance(),
       history: this.service.listMessages({ limit: DEFAULT_PAGE_SIZE, offset: 0 }),
       daily: this.service.getDailyUsage(),
+      summary: this.service.getStatusSummary(),
       invoices: this.service.listInvoices(),
     })
       .pipe(takeUntil(this.destroy$))
       .subscribe({
-        next: ({ balance, history, daily, invoices }) => {
+        next: ({ balance, history, daily, summary, invoices }) => {
           this.balance = balance;
           this.applyHistory(history, { append: false });
           this.applyDailyUsage(daily);
+          this.applyStatusSummary(summary);
           this.invoices = [...invoices];
           this.loading = false;
           this.initialLoadDone = true;
@@ -345,6 +364,20 @@ export class UsageDashboardComponent implements OnInit, OnDestroy {
   }
 
   /**
+   * Store the status-summary response the "desglose por
+   * estado" card binds to. The function keeps the full
+   * :class:`StatusSummaryResponse` (rather than just the
+   * items array) so the template can read the headline
+   * counters and the cost / fee totals without the
+   * component having to re-derive them.
+   */
+  private applyStatusSummary(summary: StatusSummaryResponse): void {
+    this.statusSummary = summary;
+    this.statusSummarySince = summary.since;
+    this.statusSummaryUntil = summary.until;
+  }
+
+  /**
    * Compute the maximum count in the daily series. The
    * chart's CSS ``height`` percentages are normalised
    * against this value so a single outlier does not
@@ -503,5 +536,101 @@ export class UsageDashboardComponent implements OnInit, OnDestroy {
    */
   trackInvoice(_index: number, invoice: InvoiceRow): string {
     return invoice.id;
+  }
+
+  /**
+   * ``trackBy`` for the per-status breakdown list. The
+   * status enum value uniquely identifies a row so the
+   * DOM stays stable across re-renders.
+   */
+  trackStatusSummary(_index: number, row: StatusSummaryBucket): string {
+    return row.status;
+  }
+
+  /**
+   * Project a status enum into the Spanish label the
+   * breakdown list shows. The mapping mirrors the
+   * :func:`UsageDashboardService.formatStatus` helper
+   * so the two views (the table's "Estado" column and
+   * the breakdown's per-row label) stay in sync.
+   */
+  statusSummaryStatusLabel(status: MessageStatus): string {
+    return this.service.formatStatus(status);
+  }
+
+  /**
+   * Tailwind-friendly dot colour for a status. The
+   * colour mirrors the badge colour the history table
+   * uses for the matching status (delivered / sent →
+   * emerald; queued / pending → amber; failed → rose;
+   * unknown → slate) so the two views feel
+   * consistent.
+   */
+  statusSummaryDotClass(status: MessageStatus): string {
+    switch (status) {
+      case 'delivered':
+      case 'sent':
+        return 'bg-emerald-500';
+      case 'queued':
+      case 'pending':
+        return 'bg-amber-500';
+      case 'failed':
+        return 'bg-rose-500';
+      case 'unknown':
+      default:
+        return 'bg-slate-400';
+    }
+  }
+
+  /**
+   * Width percentage of the delivery-rate progress bar.
+   * The value is clamped to ``[0, 100]`` so a future
+   * refactor that returns a ``delivery_rate`` outside
+   * the documented ``[0.0, 1.0]`` range does not
+   * produce a negative or oversized bar.
+   */
+  statusSummaryDeliveryWidth(summary: StatusSummaryResponse): number {
+    if (summary.total <= 0) {
+      return 0;
+    }
+    return Math.max(0, Math.min(100, Math.round(summary.delivery_rate * 100)));
+  }
+
+  /**
+   * Delivery-rate percentage as a rounded integer. The
+   * value is what the badge next to the progress bar
+   * shows ("87%"); the bar width is a separate
+   * :func:`statusSummaryDeliveryWidth` call so the two
+   * can diverge if a future design wants finer-grained
+   * width resolution.
+   */
+  statusSummaryDeliveryPercent(summary: StatusSummaryResponse): number {
+    return this.statusSummaryDeliveryWidth(summary);
+  }
+
+  /**
+   * Per-status percentage of the total. The value is
+   * an integer (``0`` – ``100``) and returns ``0`` for
+   * an empty summary so the template can render the
+   * number without a special-case branch.
+   */
+  statusSummaryPercent(count: number, total: number): number {
+    if (total <= 0) {
+      return 0;
+    }
+    return Math.round((count / total) * 100);
+  }
+
+  /**
+   * Average cost per message in the active window. The
+   * helper is a thin wrapper around a ``total > 0``
+   * guard so the footer does not show a "$NaN" when
+   * the customer has not sent any messages.
+   */
+  statusSummaryAverageCost(summary: StatusSummaryResponse): number {
+    if (summary.total <= 0) {
+      return 0;
+    }
+    return Math.round(summary.cost_clp / summary.total);
   }
 }

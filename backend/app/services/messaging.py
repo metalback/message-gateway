@@ -33,6 +33,16 @@ Public functions:
                           ``since`` / ``until`` filters the
                           usage dashboard uses to drive its
                           "historial" view.
+- :func:`message_status_summary` – per-status aggregate of the
+                                   customer's traffic for the
+                                   "desglose por estado"
+                                   card on the dashboard
+                                   (delivered / failed /
+                                   pending / queued / sent /
+                                   unknown).
+- :func:`daily_message_counts` – per-day, per-channel counts
+                                 for the dashboard's "gráfico
+                                 de barras" widget.
 - :func:`compute_message_cost` – pure helper that maps a
                                   channel + plan to the cost /
                                   fee the message should be
@@ -304,6 +314,71 @@ class DailyUsagePage:
     items: list[DailyMessageCount]
     since: datetime
     until: datetime
+
+
+@dataclass(frozen=True)
+class MessageStatusCount:
+    """A single ``(status, count)`` row in a status summary.
+
+    The dashboard uses the value to render the
+    "desglose por estado" widget (the breakdown of
+    delivered / failed / pending / queued / sent /
+    unknown messages for the active period). A
+    :class:`MessageStatusSummary` always carries one
+    entry per :class:`MessageStatus` value – the
+    service layer zero-fills any status with no
+    traffic so the dashboard does not have to
+    special-case missing rows.
+    """
+
+    status: MessageStatus
+    count: int
+
+
+@dataclass(frozen=True)
+class MessageStatusSummary:
+    """The output of :func:`message_status_summary`.
+
+    The dataclass is the source of truth for the
+    "desglose por estado" card on the dashboard. It
+    pairs the per-status counts with the headline
+    ``total`` counter, the resolved ``since`` /
+    ``until`` window, the summed ``cost_clp`` /
+    ``fee_clp`` amounts and the ``delivery_rate`` the
+    dashboard renders as a progress bar.
+
+    The window is echoed back so the dashboard can
+    show "resumen del 1 al 30 de junio" without
+    having to mirror the default-31-day-window
+    logic on the client (the same rationale as
+    :class:`DailyUsagePage`).
+    """
+
+    items: list[MessageStatusCount]
+    total: int
+    delivered: int
+    failed: int
+    pending: int
+    cost_clp: int
+    fee_clp: int
+    since: datetime
+    until: datetime
+
+    @property
+    def delivery_rate(self) -> float:
+        """Fraction of messages that reached ``delivered``.
+
+        The value is in the closed interval ``[0.0, 1.0]``
+        and defaults to ``0.0`` when the customer has not
+        sent any messages in the window – a dashboard
+        that divides by ``total`` would otherwise blow up
+        on a brand-new account. The route layer projects
+        the value onto a 0-100 percentage so the client
+        does not have to multiply by 100 itself.
+        """
+        if self.total <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.delivered / self.total))
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1258,197 @@ async def daily_message_counts(
     return DailyUsagePage(items=items, since=since, until=until)
 
 
+# ---------------------------------------------------------------------------
+# Status summary
+# ---------------------------------------------------------------------------
+#
+# The "Historial y consumo" dashboard renders a "desglose por
+# estado" card (delivered / failed / pending / queued / sent /
+# unknown) above the history table so a customer can see at a
+# glance how their traffic is doing (PRD user story #13: "ver
+# el historial de mensajes enviados con sus estados, para
+# debugging"). The endpoint is a thin aggregation over the
+# same table the daily chart uses, but it does not slice by
+# day – the dashboard wants a single ``total`` per status, not
+# a per-day series.
+
+
+# Default window for ``message_status_summary`` when the
+# caller does not pin a ``since`` value. 31 days matches
+# the daily chart's default so the two widgets describe the
+# same period and the numbers are directly comparable.
+_SUMMARY_DEFAULT_DAYS = 31
+
+# Hard cap on the date range a single call can cover.
+# Same number as the daily endpoint for symmetry.
+_SUMMARY_HARD_LIMIT_DAYS = 366
+
+
+def _summary_default_range(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Return ``[since, until]`` for the default summary window.
+
+    The window covers the trailing 31 days, ending at the
+    current instant. Mirrors :func:`_daily_default_range` so
+    the two widgets describe the same period by default.
+    """
+    anchor = now or datetime.now(tz=UTC)
+    start_day = anchor.date() - timedelta(days=_SUMMARY_DEFAULT_DAYS - 1)
+    start = datetime.combine(start_day, datetime.min.time(), tzinfo=UTC)
+    return start, anchor
+
+
+async def message_status_summary(
+    session: AsyncSession,
+    *,
+    client: Client,
+    channel: object | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    settings: Settings | None = None,
+) -> MessageStatusSummary:
+    """Aggregate the customer's messages by status for the period.
+
+    The function backs the dashboard's "desglose por estado"
+    card. It returns a :class:`MessageStatusSummary` whose
+    ``items`` field is a flat list of
+    :class:`MessageStatusCount` rows (one per
+    :class:`MessageStatus` value, zero-filled for statuses
+    with no traffic) plus the headline ``total`` counter,
+    the resolved ``since`` / ``until`` window, the summed
+    ``cost_clp`` / ``fee_clp`` amounts and the
+    ``delivered`` / ``failed`` / ``pending`` counters the
+    widget surfaces in the headline cards.
+
+    Filtering mirrors :func:`daily_message_counts`:
+
+    - ``since`` / ``until`` bound ``created_at`` (inclusive).
+      An inverted range is a 422; the function does not
+      silently return an empty list.
+    - ``channel`` accepts either a :class:`Channel` enum
+      member or the matching string. An unknown value is a
+      422; the dashboard never sends one.
+
+    Cross-tenant access is blocked by the ``client_id``
+    WHERE clause – the function never returns another
+    customer's rows.
+    """
+    _ = settings  # kept for symmetry with the rest of the service
+    if not isinstance(client, Client):
+        raise InvalidListFilterError("invalid_client", "client is required")
+    if since is not None and until is not None and since > until:
+        raise InvalidListFilterError(
+            "invalid_date_range",
+            "since must be earlier than or equal to until",
+        )
+    if since is None and until is None:
+        since, until = _summary_default_range()
+    elif since is None:
+        assert until is not None  # narrow the union for mypy
+        since = until - timedelta(days=_SUMMARY_DEFAULT_DAYS - 1)
+    elif until is None:
+        assert since is not None  # narrow the union for mypy
+        until = since + timedelta(days=_SUMMARY_DEFAULT_DAYS - 1)
+    # ``since`` and ``until`` are non-None at this point: every
+    # branch above either leaves the argument alone (already
+    # non-None) or assigns a fresh value. The explicit assertion
+    # is a safety net so a future refactor that re-introduces a
+    # ``None`` branch fails loudly here rather than in the SQL
+    # builder.
+    assert since is not None and until is not None
+    if (until - since).days > _SUMMARY_HARD_LIMIT_DAYS:
+        raise InvalidListFilterError(
+            "invalid_date_range",
+            f"date range cannot exceed {_SUMMARY_HARD_LIMIT_DAYS} days",
+        )
+    channel_filter = _normalise_channel_filter(channel)
+
+    where: list[ColumnElement[bool]] = [
+        Message.client_id == client.id,
+        Message.created_at >= since,
+        Message.created_at <= until,
+    ]
+    if channel_filter is not None:
+        where.append(Message.channel == channel_filter)
+
+    # Single round-trip aggregation: ``GROUP BY status`` plus
+    # the sum of the cost / fee columns. The dashboard does
+    # not need a per-channel breakdown here – the per-channel
+    # number lives on the daily chart – so a single
+    # ``GROUP BY`` is enough.
+    stmt = (
+        select(
+            Message.status.label("status"),
+            func.count(Message.id).label("count"),
+            func.coalesce(func.sum(Message.cost_clp), 0).label("cost_clp"),
+            func.coalesce(func.sum(Message.fee_clp), 0).label("fee_clp"),
+        )
+        .where(and_(*where))
+        .group_by(Message.status)
+    )
+    result = await session.execute(stmt)
+    rows = list(result.all())
+
+    # Zero-fill every status so the dashboard can iterate over
+    # the response without having to special-case a missing
+    # row. The order matches the order the dashboard renders
+    # the breakdown (delivered first, then sent, then
+    # in-flight, then failed / unknown).
+    counts: dict[MessageStatus, int] = {status: 0 for status in MessageStatus}
+    cost_total = 0
+    fee_total = 0
+    for row in rows:
+        mapping = row._mapping
+        # The ``MessageStatus`` enum value is the column type,
+        # so the mapping returns the enum member directly;
+        # we re-validate through :class:`MessageStatus` to
+        # cover a future migration that drops the enum
+        # (the aggregator would still return strings).
+        raw_status = mapping["status"]
+        if isinstance(raw_status, MessageStatus):
+            status = raw_status
+        else:
+            try:
+                status = MessageStatus(str(raw_status))
+            except ValueError:
+                # An unrecognised status is a data-quality
+                # bug, not a customer error: surface it as
+                # ``unknown`` so the dashboard still gets a
+                # number for it.
+                status = MessageStatus.UNKNOWN
+        counts[status] = int(mapping["count"])
+        cost_total += int(mapping["cost_clp"])
+        fee_total += int(mapping["fee_clp"])
+
+    # Build the per-status item list. The ordering is the
+    # platform's lifecycle order (delivered → sent → queued
+    # → pending → failed → unknown) so the dashboard renders
+    # the bars in a stable, intuitive sequence.
+    ordered_statuses: tuple[MessageStatus, ...] = (
+        MessageStatus.DELIVERED,
+        MessageStatus.SENT,
+        MessageStatus.QUEUED,
+        MessageStatus.PENDING,
+        MessageStatus.FAILED,
+        MessageStatus.UNKNOWN,
+    )
+    items = [
+        MessageStatusCount(status=status, count=counts[status])
+        for status in ordered_statuses
+    ]
+    total = sum(counts.values())
+    return MessageStatusSummary(
+        items=items,
+        total=total,
+        delivered=counts[MessageStatus.DELIVERED],
+        failed=counts[MessageStatus.FAILED],
+        pending=counts[MessageStatus.PENDING],
+        cost_clp=cost_total,
+        fee_clp=fee_total,
+        since=since,
+        until=until,
+    )
+
+
 def _coerce_day(value: object) -> date:
     """Normalise a ``GROUP BY date(...)`` result to a :class:`date`.
 
@@ -1222,6 +1488,8 @@ __all__ = (
     "MessageExport",
     "MessageListPage",
     "MessageNotFoundError",
+    "MessageStatusCount",
+    "MessageStatusSummary",
     "MessagingError",
     "SendOutcome",
     "compute_message_cost",
@@ -1229,6 +1497,7 @@ __all__ = (
     "get_message_status",
     "iter_messages_for_export",
     "list_messages",
+    "message_status_summary",
     "render_messages_csv",
     "send_batch",
     "send_message",

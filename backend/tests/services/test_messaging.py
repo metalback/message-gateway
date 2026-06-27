@@ -53,6 +53,7 @@ from app.services.messaging import (
     get_message_status,
     iter_messages_for_export,
     list_messages,
+    message_status_summary,
     render_messages_csv,
     send_batch,
     send_message,
@@ -1571,4 +1572,321 @@ async def test_daily_message_counts_rejects_unknown_channel(
             settings=messaging_settings,
         )
     assert exc.value.code == "invalid_channel"
+
+
+# ---------------------------------------------------------------------------
+# message_status_summary
+# ---------------------------------------------------------------------------
+#
+# The "Historial y consumo" dashboard's "desglose por estado"
+# card is backed by :func:`message_status_summary`. The tests
+# pin the aggregation contract: per-status counts ordered in
+# the platform's lifecycle order, zero-filled for statuses with
+# no traffic, the cross-tenant guard, the channel / date range
+# filters and the headline counter derivation. The function is
+# pure database, so the seed pattern matches the rest of the
+# list-messaging tests.
+
+
+async def test_message_status_summary_aggregates_per_status(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """Three delivered messages, two sent, one failed and one
+    pending produce a :class:`MessageStatusSummary` whose
+    ``items`` list carries one row per :class:`MessageStatus`
+    value (zero-filled for ``queued`` and ``unknown``) in the
+    platform's lifecycle order. The headline counters and the
+    summed cost / fee amounts are derived from the same
+    aggregation."""
+    client = await _make_client(async_session)
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    for _ in range(3):
+        await _seed_message_at(
+            async_session, client_id=client.id, channel=Channel.WHATSAPP,
+            status=MessageStatus.DELIVERED, when=now,
+            body="delivered",
+        )
+    for _ in range(2):
+        await _seed_message_at(
+            async_session, client_id=client.id, channel=Channel.SMS,
+            status=MessageStatus.SENT, when=now, body="sent",
+        )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.FAILED, when=now, body="failed",
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.PENDING, when=now, body="pending",
+    )
+
+    summary = await message_status_summary(
+        async_session,
+        client=client,
+        since=now - timedelta(days=1),
+        until=now + timedelta(days=1),
+        settings=messaging_settings,
+    )
+
+    # The lifecycle order is platform-wide: delivered, sent,
+    # queued, pending, failed, unknown. ``queued`` and
+    # ``unknown`` are zero-filled because no row used them.
+    assert [(row.status, row.count) for row in summary.items] == [
+        (MessageStatus.DELIVERED, 3),
+        (MessageStatus.SENT, 2),
+        (MessageStatus.QUEUED, 0),
+        (MessageStatus.PENDING, 1),
+        (MessageStatus.FAILED, 1),
+        (MessageStatus.UNKNOWN, 0),
+    ]
+    assert summary.total == 7
+    assert summary.delivered == 3
+    assert summary.failed == 1
+    assert summary.pending == 1
+    # ``delivery_rate`` is 3/7 ≈ 0.4286, clamped to the
+    # closed interval ``[0.0, 1.0]``.
+    assert summary.delivery_rate == pytest.approx(3 / 7)
+    # The window is echoed back so the dashboard can render
+    # "resumen del 14 al 16 de junio" without mirroring the
+    # service's default-window logic.
+    assert summary.since == now - timedelta(days=1)
+    assert summary.until == now + timedelta(days=1)
+
+
+async def test_message_status_summary_does_not_leak_other_clients(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The aggregation is tenant-scoped, just like
+    :func:`list_messages` and :func:`daily_message_counts`.
+    The test seeds rows for two customers and asserts the
+    first customer only ever sees their own totals."""
+    other = Client(
+        name="Other",
+        email="other@acme.cl",
+        rut="98765432-1",
+        password_hash="hashed",
+        api_key_hash="also-hashed",
+        api_key_last4="abcd",
+        plan=ClientPlan.STARTER,
+        status=ClientStatus.ACTIVE,
+    )
+    async_session.add(other)
+    await async_session.commit()
+    me = await _make_client(async_session)
+
+    when = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    await _seed_message_at(
+        async_session, client_id=other.id, channel=Channel.SMS,
+        status=MessageStatus.DELIVERED, when=when,
+    )
+    await _seed_message_at(
+        async_session, client_id=me.id, channel=Channel.SMS,
+        status=MessageStatus.DELIVERED, when=when,
+    )
+
+    summary = await message_status_summary(
+        async_session,
+        client=me,
+        since=when - timedelta(days=1),
+        until=when + timedelta(days=1),
+        settings=messaging_settings,
+    )
+    assert summary.total == 1
+    assert summary.delivered == 1
+    assert summary.delivery_rate == 1.0
+
+
+async def test_message_status_summary_filters_by_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The ``channel`` filter narrows the result to a single
+    channel. The test seeds both channels and asks for
+    WhatsApp only; the SMS row never makes it into the
+    response."""
+    client = await _make_client(async_session)
+    when = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=when,
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.WHATSAPP,
+        status=MessageStatus.DELIVERED, when=when,
+    )
+
+    summary = await message_status_summary(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        since=when - timedelta(days=1),
+        until=when + timedelta(days=1),
+        settings=messaging_settings,
+    )
+    assert summary.total == 1
+    assert summary.delivered == 1
+    # The ``delivered`` row is the WhatsApp one; the SMS row
+    # is filtered out.
+    by_status = {row.status: row.count for row in summary.items}
+    assert by_status[MessageStatus.DELIVERED] == 1
+    assert by_status[MessageStatus.SENT] == 0
+
+
+async def test_message_status_summary_uses_default_window_when_unset(
+    async_session, fake_providers, messaging_settings, monkeypatch
+) -> None:
+    """When the caller omits both ``since`` and ``until`` the
+    function falls back to a 31-day window ending "now". The
+    test pins ``now`` to a deterministic instant via a
+    monkey-patched module function and seeds one row inside
+    the window plus one outside, asserting only the in-window
+    row is returned."""
+    from app.services import messaging as messaging_module
+
+    fixed_now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        messaging_module,
+        "_summary_default_range",
+        lambda now=None: (fixed_now - timedelta(days=30), fixed_now),
+    )
+    client = await _make_client(async_session)
+    inside = await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=fixed_now - timedelta(days=2),
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=fixed_now - timedelta(days=60),
+    )
+
+    summary = await message_status_summary(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert summary.total == 1
+    assert summary.delivered == 0
+    # The default window is echoed back so the dashboard can
+    # show "resumen del 16 de mayo al 15 de junio".
+    assert summary.since == fixed_now - timedelta(days=30)
+    assert summary.until == fixed_now
+    # ``inside`` is only assigned so the test seeds a
+    # in-window row explicitly; the assertion that follows
+    # is the per-status total above.
+    assert inside.status == MessageStatus.SENT
+
+
+async def test_message_status_summary_rejects_inverted_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """An inverted ``since`` / ``until`` is rejected with a
+    422-friendly :class:`InvalidListFilterError` so the
+    dashboard can surface a useful inline error."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await message_status_summary(
+            async_session,
+            client=client,
+            since=datetime(2030, 1, 1, tzinfo=UTC),
+            until=datetime(2020, 1, 1, tzinfo=UTC),
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_date_range"
+
+
+async def test_message_status_summary_rejects_oversized_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A range wider than the hard cap is rejected before the
+    database is hit so a curious operator cannot force a
+    full-table aggregation."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await message_status_summary(
+            async_session,
+            client=client,
+            since=datetime(2020, 1, 1, tzinfo=UTC),
+            until=datetime(2026, 1, 1, tzinfo=UTC),
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_date_range"
+
+
+async def test_message_status_summary_empty_history_returns_zero_totals(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed response (every status zero-filled, every
+    headline counter at zero, ``delivery_rate`` at 0.0) so
+    the dashboard can render the "todavía no has enviado
+    mensajes" empty state without a special-case branch."""
+    client = await _make_client(async_session)
+    summary = await message_status_summary(
+        async_session,
+        client=client,
+        since=datetime(2026, 6, 1, tzinfo=UTC),
+        until=datetime(2026, 6, 30, tzinfo=UTC),
+        settings=messaging_settings,
+    )
+    assert summary.total == 0
+    assert summary.delivered == 0
+    assert summary.failed == 0
+    assert summary.pending == 0
+    assert summary.cost_clp == 0
+    assert summary.fee_clp == 0
+    assert summary.delivery_rate == 0.0
+    # Every status row is present, all with a count of zero –
+    # the dashboard iterates the list without checking for
+    # ``None`` rows.
+    assert {row.status for row in summary.items} == set(MessageStatus)
+    assert all(row.count == 0 for row in summary.items)
+
+
+async def test_message_status_summary_rejects_unknown_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A bogus channel string is a 422 (not a silent empty
+    list) so a typo in a future caller surfaces immediately."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await message_status_summary(
+            async_session,
+            client=client,
+            channel="carrier-pigeon",
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_channel"
+
+
+async def test_message_status_summary_sums_cost_and_fee(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The ``cost_clp`` / ``fee_clp`` fields of the response
+    are the sum of the matching columns across every row in
+    the window, regardless of the row's status. The test
+    seeds rows with a mix of costs / fees and asserts the
+    response carries the summed values verbatim."""
+    client = await _make_client(async_session)
+    when = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.WHATSAPP,
+        status=MessageStatus.DELIVERED, when=when, body="d",
+    )
+    # Manually patch the cost / fee columns for each seeded
+    # row so the assertion is independent of the cost /
+    # markup numbers the service module hard-codes. The
+    # values are arbitrary integers – only the sum matters.
+    rows = list(
+        (await async_session.execute(select(Message))).scalars().all()
+    )
+    rows[0].cost_clp = 100
+    rows[0].fee_clp = 10
+    await async_session.commit()
+
+    summary = await message_status_summary(
+        async_session,
+        client=client,
+        since=when - timedelta(days=1),
+        until=when + timedelta(days=1),
+        settings=messaging_settings,
+    )
+    assert summary.cost_clp == 100
+    assert summary.fee_clp == 10
 

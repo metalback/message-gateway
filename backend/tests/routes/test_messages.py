@@ -1310,3 +1310,230 @@ def test_daily_usage_empty_history_returns_well_formed_response(
     assert payload["items"] == []
     assert "since" in payload and "until" in payload
 
+
+# ---------------------------------------------------------------------------
+# GET /v1/messages/summary
+# ---------------------------------------------------------------------------
+#
+# HTTP-level tests for the "desglose por estado" widget on
+# the dashboard. The tests exercise the observable contract
+# (status codes, response shapes) end-to-end through the
+# FastAPI app; the service-level behaviour (per-status
+# aggregation, cross-tenant guard, default window, …) is
+# covered by :mod:`tests.services.test_messaging`.
+
+
+def test_status_summary_returns_per_status_counts(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """Three SMS sends and one WhatsApp send produce a
+    response that carries one row per ``MessageStatus``
+    value (zero-filled for statuses with no traffic) and
+    the headline ``total`` / ``delivered`` / ``failed`` /
+    ``pending`` counters. ``delivery_rate`` is the
+    fraction of messages in the ``delivered`` state,
+    expressed in the closed interval ``[0.0, 1.0]``."""
+    body = _register(client)
+    api_key = body["api_key"]
+    for i in range(3):
+        _send_one(client, api_key=api_key, to=f"+5691111111{i}", body="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    # Every status row is present (zero-filled for statuses
+    # the customer has not produced), in the platform's
+    # lifecycle order.
+    statuses = [row["status"] for row in payload["items"]]
+    assert statuses == [
+        "delivered", "sent", "queued", "pending", "failed", "unknown"
+    ]
+    counts = {row["status"]: row["count"] for row in payload["items"]}
+    # ``_send_one`` goes through the provider stub, which
+    # returns ``"sent"`` by default. The service layer maps
+    # that to :attr:`MessageStatus.SENT` (the upstream
+    # acknowledged the message); the ``delivered`` count is
+    # therefore zero – the platform only marks a message
+    # as ``delivered`` when the recipient's handset
+    # confirms delivery.
+    assert counts["sent"] == 4
+    assert counts["delivered"] == 0
+    # Headline counters.
+    assert payload["total"] == 4
+    assert payload["delivered"] == 0
+    assert payload["failed"] == 0
+    assert payload["pending"] == 0
+    assert payload["delivery_rate"] == 0.0
+    # The window is echoed back so the dashboard can render
+    # the "resumen del … al …" subtitle.
+    assert "since" in payload and "until" in payload
+
+
+def test_status_summary_respects_channel_filter(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``?channel=`` query parameter narrows the
+    aggregation to a single channel. The test seeds a mix
+    of SMS and WhatsApp messages and asserts the ``sms``
+    filter only returns the SMS totals."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="sms")
+    _send_one(
+        client, api_key=api_key, to="+56922222222", body="wa", channel="whatsapp"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        params={"channel": "sms"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+
+
+def test_status_summary_respects_date_range(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """The ``since`` / ``until`` query parameters narrow the
+    aggregation to the requested window. The test asserts
+    the response carries the resolved bounds so the
+    dashboard can render the "resumen del … al …" subtitle
+    without a second round-trip."""
+    body = _register(client)
+    api_key = body["api_key"]
+    _send_one(client, api_key=api_key, to="+56911111111", body="uno")
+
+    since = "2026-01-01T00:00:00+00:00"
+    until = "2026-12-31T23:59:59+00:00"
+    response = client.get(
+        "/v1/messages/summary",
+        params={"since": since, "until": until},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["since"].startswith("2026-01-01")
+    assert payload["until"].startswith("2026-12-31")
+
+
+def test_status_summary_does_not_leak_other_clients(
+    client: TestClient, fake_provider: FakeProvider
+) -> None:
+    """A second customer's history must not bleed into the
+    first customer's status summary. The test seeds
+    messages for both customers and asserts the first
+    customer only ever sees their own totals."""
+    me = _register(client)
+    other = client.post(
+        "/v1/auth/register",
+        json={
+            "name": "Other",
+            "email": "other@acme.cl",
+            "rut": "11.111.111-1",
+            "password": "another-secret",
+        },
+    ).json()
+    _send_one(client, api_key=me["api_key"], to="+56911111111", body="mine")
+    _send_one(
+        client, api_key=other["api_key"], to="+56922222222", body="theirs"
+    )
+
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": me["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+
+
+def test_status_summary_401_when_api_key_missing(
+    client: TestClient,
+) -> None:
+    """A missing ``X-API-Key`` is a 401 with a stable code;
+    the test guards against a regression that would let an
+    unauthenticated caller read the status summary."""
+    response = client.get("/v1/messages/summary")
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "missing_api_key"
+
+
+def test_status_summary_422_on_inverted_date_range(
+    client: TestClient,
+) -> None:
+    """An inverted date range is a 422 with the same
+    ``invalid_date_range`` code the other message endpoints
+    use. The test pins the contract so a future regression
+    in the call site does not silently return an empty
+    response."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        params={
+            "since": "2030-01-01T00:00:00+00:00",
+            "until": "2020-01-01T00:00:00+00:00",
+        },
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_date_range"
+
+
+def test_status_summary_empty_history_returns_well_formed_response(
+    client: TestClient,
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed response (every status row present with a
+    count of zero, headline counters at zero, ``delivery_rate``
+    at 0.0) so the dashboard can render the "todavía no has
+    enviado mensajes" empty state without a special-case
+    branch."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 0
+    assert payload["delivered"] == 0
+    assert payload["failed"] == 0
+    assert payload["pending"] == 0
+    assert payload["delivery_rate"] == 0.0
+    # Every status row is present, all with a count of zero.
+    assert {row["status"] for row in payload["items"]} == {
+        "delivered", "sent", "queued", "pending", "failed", "unknown"
+    }
+    assert all(row["count"] == 0 for row in payload["items"])
+    assert "since" in payload and "until" in payload
+
+
+def test_status_summary_does_not_match_get_by_id(
+    client: TestClient,
+) -> None:
+    """``/v1/messages/summary`` must not be matched by the
+    ``/v1/messages/{message_id}`` route – a request for the
+    literal id ``"summary"`` is a 404 (not the 200 the
+    summary endpoint would return). The test pins the
+    route-ordering contract so a future refactor that
+    re-orders the routes fails loudly in CI."""
+    body = _register(client)
+    response = client.get(
+        "/v1/messages/summary",
+        headers={"X-API-Key": body["api_key"]},
+    )
+    # The summary endpoint is mounted before the path-param
+    # endpoint, so the request hits the summary handler and
+    # returns a 200 (not a 404 the path-param handler would
+    # raise for an unknown id).
+    assert response.status_code == 200
+    assert "items" in response.json()
+

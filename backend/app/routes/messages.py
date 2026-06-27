@@ -6,6 +6,10 @@ Implements the public surface documented in the PRD:
                                   customer's message history
                                   (used by the dashboard's
                                   "Historial y consumo" view).
+- ``GET  /v1/messages/summary`` – per-status aggregate of the
+                                  customer's traffic for the
+                                  "desglose por estado" card
+                                  on the dashboard.
 - ``GET  /v1/messages/daily``  – per-day, per-channel counts
                                   for the "gráfico de barras"
                                   the dashboard renders above
@@ -56,12 +60,14 @@ from app.services.messaging import (
     MessageExport,
     MessageListPage,
     MessageNotFoundError,
+    MessageStatusSummary,
     MessagingError,
     SendOutcome,
     daily_message_counts,
     get_message_status,
     iter_messages_for_export,
     list_messages,
+    message_status_summary,
     render_messages_csv,
     send_batch,
     send_message,
@@ -197,6 +203,45 @@ class DailyUsageResponse(BaseModel):
     since: datetime
     until: datetime
     items: list[DailyUsageBucket]
+
+
+class StatusSummaryBucket(BaseModel):
+    """A single ``(status, count)`` row in the status
+    summary response.
+
+    Mirrors the :class:`MessageStatusCount` dataclass the
+    service layer returns. The route layer projects the
+    value directly; the dashboard does not have to know
+    about the dataclass type.
+    """
+
+    status: MessageStatus
+    count: int
+
+
+class StatusSummaryResponse(BaseModel):
+    """Response of a successful ``GET /v1/messages/summary``.
+
+    The endpoint carries the per-status buckets, the
+    headline counters the dashboard surfaces in the
+    "desglose por estado" card, the summed cost / fee
+    amounts, the resolved ``since`` / ``until`` window
+    and the ``delivery_rate`` the widget renders as a
+    progress bar. ``delivery_rate`` is in the closed
+    interval ``[0.0, 1.0]``; the client multiplies by
+    ``100`` to render a percentage.
+    """
+
+    items: list[StatusSummaryBucket]
+    total: int
+    delivered: int
+    failed: int
+    pending: int
+    cost_clp: int
+    fee_clp: int
+    delivery_rate: float
+    since: datetime
+    until: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +624,84 @@ async def daily_usage(
             DailyUsageBucket(day=row.day, channel=row.channel, count=row.count)
             for row in page.items
         ],
+    )
+
+
+@router.get(
+    "/summary",
+    response_model=StatusSummaryResponse,
+    responses={
+        200: {
+            "description": (
+                "Per-status aggregate of the customer's traffic "
+                "for the resolved window. Drives the "
+                "'desglose por estado' card on the dashboard."
+            ),
+        },
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        422: {"description": "The filter values failed validation."},
+    },
+)
+async def status_summary(
+    channel: Channel | None = Query(
+        default=None,
+        description="Restrict the aggregation to a single delivery channel.",
+    ),
+    since: datetime | None = Query(
+        default=None,
+        description="Lower bound on ``created_at``. Defaults to a 31-day rolling window.",
+    ),
+    until: datetime | None = Query(
+        default=None,
+        description="Upper bound on ``created_at``. Defaults to the current instant.",
+    ),
+    current_client: Client = Depends(require_api_key),
+    session: AsyncSession = Depends(get_db),
+) -> StatusSummaryResponse:
+    """Return the per-status message counts the dashboard's
+    "desglose por estado" card renders.
+
+    The endpoint pairs the per-status buckets with the
+    headline counters (``total`` / ``delivered`` /
+    ``failed`` / ``pending``), the summed ``cost_clp`` /
+    ``fee_clp`` amounts, the ``delivery_rate`` the widget
+    renders as a progress bar and the resolved ``since`` /
+    ``until`` window. A request with no query parameters
+    returns the trailing 31 days (same default as
+    ``/v1/messages/daily`` so the two widgets describe the
+    same period by default).
+
+    The route is mounted at ``/messages/summary`` so it
+    sits cleanly above the ``/messages/{message_id}``
+    path the rest of the API uses. The literal segment
+    keeps FastAPI's route matcher from trying to resolve
+    ``summary`` as a message id (the same pattern the
+    ``/messages/export`` route uses).
+    """
+    try:
+        summary: MessageStatusSummary = await message_status_summary(
+            session,
+            client=current_client,
+            channel=channel,
+            since=since,
+            until=until,
+        )
+    except InvalidListFilterError as exc:
+        _raise_messaging_error(exc)
+    return StatusSummaryResponse(
+        items=[
+            StatusSummaryBucket(status=row.status, count=row.count)
+            for row in summary.items
+        ],
+        total=summary.total,
+        delivered=summary.delivered,
+        failed=summary.failed,
+        pending=summary.pending,
+        cost_clp=summary.cost_clp,
+        fee_clp=summary.fee_clp,
+        delivery_rate=summary.delivery_rate,
+        since=summary.since,
+        until=summary.until,
     )
 
 

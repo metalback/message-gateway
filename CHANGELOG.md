@@ -153,6 +153,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   tests (chart rendering with N daily bars, the chart
   empty state, the invoice list with a paid / issued
   badge).
+- "Historial y consumo" status breakdown card
+  (issue #6 follow-up): a new `GET /v1/messages/summary`
+  endpoint that returns a per-status aggregate of the
+  customer's traffic for the resolved window (one row
+  per `MessageStatus` value, zero-filled for statuses
+  with no traffic) plus the headline counters the
+  dashboard surfaces in the "Desglose por estado" card
+  (`total` / `delivered` / `failed` / `pending`), the
+  summed `cost_clp` / `fee_clp` amounts, the
+  `delivery_rate` the widget renders as a Tailwind-only
+  progress bar and the resolved `since` / `until`
+  window. The endpoint is mounted at
+  `/messages/summary` (rather than the more natural
+  `/messages/{id}` path) so the literal segment keeps
+  FastAPI's route matcher from trying to resolve
+  `summary` as a message id. The backend is covered by
+  9 new service tests + 8 new HTTP tests (per-status
+  aggregation, zero-fill, cross-tenant guard, channel
+  and date-range filters, default 31-day window,
+  inverted / oversized range, empty history, 401, 422,
+  route-ordering guard). The dashboard renders a new
+  "Desglose por estado" card on top of the history
+  table that combines the delivery-rate progress bar,
+  the per-status breakdown list (with a coloured dot
+  per status) and a cost-summary footer (total cost,
+  total fee, average cost per message). The frontend
+  gains 3 new service tests (the new endpoint's HTTP
+  contract, the filter normalisation) and 4 new
+  component tests (the breakdown card on init, the
+  delivery-rate width / percent helpers, the average
+  cost helper, the empty-state render).
 
 ### Changed
 

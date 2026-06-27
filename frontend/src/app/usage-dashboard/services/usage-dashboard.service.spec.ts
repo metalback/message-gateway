@@ -13,6 +13,7 @@ import {
   InvoiceRow,
   MessageListResponse,
   MessageRow,
+  StatusSummaryResponse,
 } from '../models/usage-dashboard.types';
 import { UsageDashboardService } from './usage-dashboard.service';
 
@@ -50,6 +51,27 @@ const SAMPLE_BALANCE: BalanceSummary = {
   overage_msgs: 0,
   overage_cost_clp: 0,
   estimated_total_clp: 23788,
+};
+
+/** A canned status-summary payload for the breakdown card tests. */
+const SAMPLE_STATUS_SUMMARY: StatusSummaryResponse = {
+  since: '2026-05-16T00:00:00+00:00',
+  until: '2026-06-15T00:00:00+00:00',
+  items: [
+    { status: 'delivered', count: 7 },
+    { status: 'sent', count: 2 },
+    { status: 'queued', count: 0 },
+    { status: 'pending', count: 1 },
+    { status: 'failed', count: 1 },
+    { status: 'unknown', count: 0 },
+  ],
+  total: 11,
+  delivered: 7,
+  failed: 1,
+  pending: 1,
+  cost_clp: 275,
+  fee_clp: 35,
+  delivery_rate: 7 / 11,
 };
 
 describe('UsageDashboardService', () => {
@@ -484,6 +506,53 @@ describe('UsageDashboardService', () => {
 
     it('returns an empty series for an empty bucket list', () => {
       expect(service.dailyTotals([])).toEqual([]);
+    });
+  });
+
+  describe('getStatusSummary', () => {
+    it('hits /v1/messages/summary with no query string when no filters are set', () => {
+      let observed: StatusSummaryResponse | undefined;
+      service.getStatusSummary().subscribe((value) => (observed = value));
+
+      const req = http.expectOne(
+        `${environment.apiBaseUrl}/v1/messages/summary`,
+      );
+      expect(req.request.method).toBe('GET');
+      expect(req.request.params.keys().length).toBe(0);
+      req.flush(SAMPLE_STATUS_SUMMARY);
+      expect(observed).toEqual(SAMPLE_STATUS_SUMMARY);
+    });
+
+    it('passes every active filter as a query parameter', () => {
+      let observed: StatusSummaryResponse | undefined;
+      service
+        .getStatusSummary({
+          channel: 'whatsapp',
+          since: '2026-06-01T00:00:00+00:00',
+          until: '2026-06-30T23:59:59+00:00',
+        })
+        .subscribe((value) => (observed = value));
+
+      const req = http.expectOne(
+        (r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`,
+      );
+      const params = req.request.params;
+      expect(params.get('channel')).toBe('whatsapp');
+      expect(params.get('since')).toBe('2026-06-01T00:00:00+00:00');
+      expect(params.get('until')).toBe('2026-06-30T23:59:59+00:00');
+      req.flush(SAMPLE_STATUS_SUMMARY);
+      expect(observed).toEqual(SAMPLE_STATUS_SUMMARY);
+    });
+
+    it('drops empty / null filters from the query string', () => {
+      service
+        .getStatusSummary({ channel: null, since: undefined, until: '' })
+        .subscribe();
+      const req = http.expectOne(
+        (r) => r.url === `${environment.apiBaseUrl}/v1/messages/summary`,
+      );
+      expect(req.request.params.keys().length).toBe(0);
+      req.flush(SAMPLE_STATUS_SUMMARY);
     });
   });
 

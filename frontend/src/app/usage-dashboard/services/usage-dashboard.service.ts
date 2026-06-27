@@ -13,6 +13,8 @@ import {
   MessageHistoryFilters,
   MessageListResponse,
   MessageRow,
+  StatusSummaryFilters,
+  StatusSummaryResponse,
 } from '../models/usage-dashboard.types';
 
 /**
@@ -109,6 +111,38 @@ export class UsageDashboardService {
       params = params.set('until', filters.until);
     }
     return this.http.get<DailyUsageResponse>(url, { params });
+  }
+
+  /**
+   * Fetch the per-status message counts that drive the
+   * dashboard's "desglose por estado" card.
+   *
+   * The endpoint is the source of truth for the default
+   * 31-day window: a request with no query parameters
+   * returns the trailing month (same default as
+   * :func:`getDailyUsage` so the two widgets describe
+   * the same period). The response carries the resolved
+   * ``since`` / ``until``, the headline counters
+   * (``total`` / ``delivered`` / ``failed`` / ``pending``),
+   * the summed ``cost_clp`` / ``fee_clp`` amounts and
+   * the ``delivery_rate`` the widget renders as a
+   * progress bar.
+   */
+  getStatusSummary(
+    filters: StatusSummaryFilters = {},
+  ): Observable<StatusSummaryResponse> {
+    const url = `${environment.apiBaseUrl}/v1/messages/summary`;
+    let params = new HttpParams();
+    if (filters.channel) {
+      params = params.set('channel', filters.channel);
+    }
+    if (filters.since) {
+      params = params.set('since', filters.since);
+    }
+    if (filters.until) {
+      params = params.set('until', filters.until);
+    }
+    return this.http.get<StatusSummaryResponse>(url, { params });
   }
 
   /**
