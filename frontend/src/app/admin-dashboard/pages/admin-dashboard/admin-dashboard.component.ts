@@ -12,6 +12,7 @@ import {
   AdminOverview,
   AdminProviderBreakdownRow,
 } from '../../models/admin-dashboard.types';
+import { ClientEditDialogResult } from '../client-edit-dialog/client-edit-dialog.component';
 
 /**
  * Page size of the admin clients / error-log tables.
@@ -89,6 +90,23 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
   /** Current offset; advanced by
    *  :data:`DEFAULT_PAGE_SIZE` per page. */
   private currentOffset = 0;
+
+  /** ``True`` while the create / edit dialog is open. */
+  dialogOpen = false;
+
+  /** Dialog mode – mirrors :attr:`ClientEditDialogComponent.mode`. */
+  dialogMode: 'create' | 'edit' = 'create';
+
+  /** Row the dialog is editing, or ``null`` in create mode. */
+  dialogClient: AdminClientRow | null = null;
+
+  /**
+   * Most recent plain API key the create dialog returned.
+   * Surfaced as a banner after the dialog closes so the
+   * operator can copy the value into the onboarding flow
+   * before navigating away.
+   */
+  lastCreatedApiKey: string | null = null;
 
   /** Subject that tears down every open subscription on destroy. */
   private readonly destroy$ = new Subject<void>();
@@ -246,6 +264,76 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
           this.cdr.markForCheck();
         },
       });
+  }
+
+  /**
+   * "Crear cliente" handler: open the dialog in create
+   * mode. The dialog manages its own form state and
+   * posts to the service on submit; the dashboard only
+   * owns the visibility flag.
+   */
+  openCreateDialog(): void {
+    this.errorMessage = null;
+    this.dialogMode = 'create';
+    this.dialogClient = null;
+    this.dialogOpen = true;
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * "Editar" handler: open the dialog in edit mode for
+   * a single client. The dialog reads the form values
+   * off the row passed in, so a stale copy of the row
+   * is fine – the server is the source of truth on
+   * submit.
+   */
+  openEditDialog(row: AdminClientRow): void {
+    this.errorMessage = null;
+    this.dialogMode = 'edit';
+    this.dialogClient = row;
+    this.dialogOpen = true;
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Dialog "save" handler. The dialog posts to the
+   * API on its own; this method just refreshes the
+   * local state from the response.
+   */
+  onDialogSave(result: ClientEditDialogResult): void {
+    this.dialogOpen = false;
+    if (result.action === 'create') {
+      this.lastCreatedApiKey = result.apiKey;
+      // Prepend the new row so the operator sees the
+      // result without waiting for a full re-fetch.
+      this.clients = [result.client, ...this.clients];
+      this.totalClients = this.clients.length;
+      this.cdr.markForCheck();
+      return;
+    }
+    this.lastCreatedApiKey = null;
+    this.replaceClient(result.client);
+  }
+
+  /**
+   * Dialog "cancel" handler. Clears the
+   * "copy this API key" banner so the previous
+   * customer's key is not silently shown while the
+   * next dialog is being filled in.
+   */
+  onDialogCancel(): void {
+    this.dialogOpen = false;
+    this.dialogClient = null;
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Dismiss the "copy this API key" banner. Wired to
+   * the banner's close button.
+   */
+  dismissCreatedApiKey(): void {
+    this.lastCreatedApiKey = null;
+    this.cdr.markForCheck();
   }
 
   /**
@@ -407,5 +495,20 @@ export class AdminDashboardComponent implements OnInit, OnDestroy {
       dateStyle: 'short',
       timeStyle: 'short',
     });
+  }
+
+  /**
+   * Project a ``avg_latency_ms`` value into a dashboard-
+   * friendly string. ``null`` (no observed dispatches for
+   * the bucket) renders as the same "—" placeholder the
+   * rest of the dashboard uses for missing values; a real
+   * value is rounded to one decimal so a "150 ms" average
+   * and a "150.4 ms" average read identically in the table.
+   */
+  formatLatency(value: number | null): string {
+    if (value === null || Number.isNaN(value)) {
+      return '—';
+    }
+    return `${value.toFixed(1)} ms`;
   }
 }

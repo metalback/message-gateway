@@ -5,12 +5,16 @@ import { RouterTestingModule } from '@angular/router/testing';
 import { of, throwError } from 'rxjs';
 
 import { AdminDashboardComponent } from './admin-dashboard.component';
+import { ClientEditDialogComponent } from '../client-edit-dialog/client-edit-dialog.component';
 import { AdminDashboardService } from '../../services/admin-dashboard.service';
 import {
   AdminClientListResponse,
+  AdminClientUpdateResponse,
+  AdminCreateClientResponse,
   AdminErrorLogResponse,
   AdminOverview,
   AdminProviderBreakdownRow,
+  AdminUpdateClientRequest,
 } from '../../models/admin-dashboard.types';
 
 /**
@@ -75,6 +79,7 @@ describe('AdminDashboardComponent', () => {
       pending: 1,
       cost_clp: 800,
       fee_clp: 50,
+      avg_latency_ms: 145.2,
     },
   ];
 
@@ -93,6 +98,8 @@ describe('AdminDashboardComponent', () => {
       'getProviderBreakdown',
       'listErrorLog',
       'suspendClient',
+      'createClient',
+      'updateClient',
       'describeError',
     ]);
     serviceStub.getOverview.and.returnValue(of(SAMPLE_OVERVIEW));
@@ -102,7 +109,7 @@ describe('AdminDashboardComponent', () => {
     serviceStub.describeError.and.returnValue('boom');
 
     await TestBed.configureTestingModule({
-      declarations: [AdminDashboardComponent],
+      declarations: [AdminDashboardComponent, ClientEditDialogComponent],
       imports: [HttpClientTestingModule, ReactiveFormsModule, RouterTestingModule],
       providers: [{ provide: AdminDashboardService, useValue: serviceStub }],
     }).compileComponents();
@@ -149,7 +156,7 @@ describe('AdminDashboardComponent', () => {
     failingStub.describeError.and.returnValue('boom');
 
     TestBed.configureTestingModule({
-      declarations: [AdminDashboardComponent],
+      declarations: [AdminDashboardComponent, ClientEditDialogComponent],
       imports: [HttpClientTestingModule, ReactiveFormsModule, RouterTestingModule],
       providers: [{ provide: AdminDashboardService, useValue: failingStub }],
     }).compileComponents();
@@ -207,5 +214,109 @@ describe('AdminDashboardComponent', () => {
   it('returns a dash for an unparseable timestamp', () => {
     expect(component.formatDate(null)).toBe('—');
     expect(component.formatDate('')).toBe('—');
+  });
+
+  it('formats a latency value with one decimal place', () => {
+    expect(component.formatLatency(145.2)).toBe('145.2 ms');
+    expect(component.formatLatency(150)).toBe('150.0 ms');
+    expect(component.formatLatency(0)).toBe('0.0 ms');
+  });
+
+  it('renders a dash for a null latency value', () => {
+    // ``null`` means "no observed dispatches for this
+    // bucket" – the dashboard renders a "—" placeholder
+    // rather than a misleading "0.0 ms".
+    expect(component.formatLatency(null)).toBe('—');
+  });
+
+  describe('create / edit dialog', () => {
+    it('opens the dialog in create mode when "Crear cliente" is invoked', () => {
+      component.openCreateDialog();
+      expect(component.dialogOpen).toBeTrue();
+      expect(component.dialogMode).toBe('create');
+      expect(component.dialogClient).toBeNull();
+    });
+
+    it('opens the dialog in edit mode with the selected row', () => {
+      const row = SAMPLE_CLIENTS.items[0];
+      component.openEditDialog(row);
+      expect(component.dialogOpen).toBeTrue();
+      expect(component.dialogMode).toBe('edit');
+      expect(component.dialogClient).toEqual(row);
+    });
+
+    it('closes the dialog and prepends the new client on a successful create', () => {
+      const newRow = {
+        ...SAMPLE_CLIENTS.items[0],
+        id: 'row-new',
+        name: 'New Co',
+      };
+      const response: AdminCreateClientResponse = {
+        client: newRow,
+        api_key: 'mgw_live_newkey1234567890',
+        api_key_last4: '7890',
+      };
+      serviceStub.createClient.and.returnValue(of(response));
+
+      component.openCreateDialog();
+      component.onDialogSave({
+        action: 'create',
+        payload: {
+          name: 'New Co',
+          email: 'hi@new.cl',
+          rut: '11111111-1',
+          password: 'sup3r',
+          plan: 'starter',
+        },
+        apiKey: response.api_key,
+        client: newRow,
+      });
+
+      expect(component.dialogOpen).toBeFalse();
+      expect(component.lastCreatedApiKey).toBe('mgw_live_newkey1234567890');
+      expect(component.clients[0].id).toBe('row-new');
+      expect(component.totalClients).toBe(component.clients.length);
+    });
+
+    it('replaces the matching row on a successful edit', () => {
+      const updatedRow = {
+        ...SAMPLE_CLIENTS.items[0],
+        plan: 'enterprise' as const,
+        status: 'suspended' as const,
+      };
+      const response: AdminClientUpdateResponse = { client: updatedRow };
+      serviceStub.updateClient.and.returnValue(of(response));
+
+      component.openEditDialog(SAMPLE_CLIENTS.items[0]);
+      const payload: AdminUpdateClientRequest = {
+        plan: 'enterprise',
+        status: 'suspended',
+      };
+      component.onDialogSave({
+        action: 'update',
+        clientId: updatedRow.id,
+        payload,
+        client: updatedRow,
+      });
+
+      expect(component.dialogOpen).toBeFalse();
+      expect(component.lastCreatedApiKey).toBeNull();
+      expect(component.clients[0]).toEqual(updatedRow);
+    });
+
+    it('closes the dialog without touching the list on cancel', () => {
+      component.openEditDialog(SAMPLE_CLIENTS.items[0]);
+      const before = component.clients;
+      component.onDialogCancel();
+      expect(component.dialogOpen).toBeFalse();
+      expect(component.dialogClient).toBeNull();
+      expect(component.clients).toBe(before);
+    });
+
+    it('dismisses the "copy this API key" banner on demand', () => {
+      component.lastCreatedApiKey = 'mgw_live_xyz';
+      component.dismissCreatedApiKey();
+      expect(component.lastCreatedApiKey).toBeNull();
+    });
   });
 });

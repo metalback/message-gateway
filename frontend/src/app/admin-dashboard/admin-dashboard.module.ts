@@ -5,6 +5,7 @@ import { RouterModule } from '@angular/router';
 
 import { AdminDashboardRoutingModule } from './admin-dashboard-routing.module';
 import { AdminDashboardComponent } from './pages/admin-dashboard/admin-dashboard.component';
+import { ClientEditDialogComponent } from './pages/client-edit-dialog/client-edit-dialog.component';
 
 /**
  * NgModule that wires the "Admin" feature (issue #10).
@@ -21,7 +22,7 @@ import { AdminDashboardComponent } from './pages/admin-dashboard/admin-dashboard
  * module.
  */
 @NgModule({
-  declarations: [AdminDashboardComponent],
+  declarations: [AdminDashboardComponent, ClientEditDialogComponent],
   imports: [
     CommonModule,
     ReactiveFormsModule,

@@ -9,13 +9,44 @@
         plataforma.
       </p>
     </div>
-    <a
-      routerLink="/usage"
-      class="text-sm font-medium text-brand-600 hover:text-brand-700"
-    >
-      ← Volver al panel de uso
-    </a>
+    <div class="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        (click)="openCreateDialog()"
+        class="rounded-md bg-brand-600 px-3 py-2 text-xs font-medium text-white hover:bg-brand-700"
+        data-testid="create-client-button"
+      >
+        + Crear cliente
+      </button>
+      <a
+        routerLink="/usage"
+        class="text-sm font-medium text-brand-600 hover:text-brand-700"
+      >
+        ← Volver al panel de uso
+      </a>
+    </div>
   </header>
+
+  <div
+    *ngIf="lastCreatedApiKey"
+    class="mb-6 flex flex-wrap items-start justify-between gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700"
+    role="status"
+    data-testid="created-api-key-banner"
+  >
+    <p>
+      Cliente creado. Comparte esta API key con el cliente antes de cerrar
+      la sesión — no se mostrará de nuevo:
+      <code class="ml-1 break-all font-mono text-xs">{{ lastCreatedApiKey }}</code>
+    </p>
+    <button
+      type="button"
+      (click)="dismissCreatedApiKey()"
+      class="text-xs font-medium text-emerald-700 hover:text-emerald-900"
+      data-testid="dismiss-api-key-banner"
+    >
+      Descartar
+    </button>
+  </div>
 
   <!-- Overview tiles -->
   <div
@@ -194,15 +225,25 @@
               {{ formatDate(client.created_at) }}
             </td>
             <td class="px-4 py-3 text-right">
-              <button
-                type="button"
-                (click)="suspend(client)"
-                [disabled]="client.status === 'suspended'"
-                class="rounded-md border border-rose-200 px-3 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
-                data-testid="suspend-button"
-              >
-                Suspender
-              </button>
+              <div class="flex justify-end gap-2">
+                <button
+                  type="button"
+                  (click)="openEditDialog(client)"
+                  class="rounded-md border border-slate-300 px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  data-testid="edit-button"
+                >
+                  Editar
+                </button>
+                <button
+                  type="button"
+                  (click)="suspend(client)"
+                  [disabled]="client.status === 'suspended'"
+                  class="rounded-md border border-rose-200 px-3 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  data-testid="suspend-button"
+                >
+                  Suspender
+                </button>
+              </div>
             </td>
           </tr>
           <tr *ngIf="!clients.length && initialLoadDone">
@@ -268,6 +309,15 @@
           <p>
             {{ row.delivered | number }} ok ·
             {{ row.failed | number }} fallidos
+          </p>
+          <p
+            class="mt-1 inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-600"
+            data-testid="breakdown-latency"
+          >
+            Latencia promedio:
+            <span class="font-semibold text-slate-900">
+              {{ formatLatency(row.avg_latency_ms) }}
+            </span>
           </p>
         </div>
       </li>
@@ -361,4 +411,12 @@
   >
     {{ errorMessage }}
   </p>
+
+  <app-client-edit-dialog
+    [open]="dialogOpen"
+    [mode]="dialogMode"
+    [client]="dialogClient"
+    (submitted)="onDialogSave($event)"
+    (cancelled)="onDialogCancel()"
+  ></app-client-edit-dialog>
 </section>
