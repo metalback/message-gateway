@@ -176,7 +176,9 @@ def test_v1_discovery_lists_feature_prefixes() -> None:
 def test_placeholder_routes_return_not_implemented() -> None:
     """Every placeholder endpoint in :mod:`app.routes` returns
     ``501 Not Implemented`` so the contract is explicit: the path
-    exists, the feature doesn't yet."""
+    exists, the feature doesn't yet. The auth ``/register`` and
+    ``/login`` endpoints are no longer placeholders (issue #3),
+    so they are excluded from this list."""
     app = create_app(Settings())
     client = TestClient(app)
 
@@ -184,7 +186,6 @@ def test_placeholder_routes_return_not_implemented() -> None:
         ("GET", "/v1/messages", 501),
         ("GET", "/v1/templates", 501),
         ("GET", "/v1/webhooks", 501),
-        ("POST", "/v1/auth/register", 501),
         ("GET", "/v1/billing/balance", 501),
     )
     for method, path, expected_status in cases:
@@ -192,3 +193,22 @@ def test_placeholder_routes_return_not_implemented() -> None:
         assert (
             response.status_code == expected_status
         ), f"{method} {path} returned {response.status_code}, expected {expected_status}"
+
+
+def test_auth_register_endpoint_is_implemented() -> None:
+    """``POST /v1/auth/register`` was a placeholder until issue #3
+    landed; the test guards against a regression that would
+    re-introduce the 501 behaviour now that the endpoint is
+    real."""
+    app = create_app(Settings())
+    client = TestClient(app)
+
+    # An empty body fails Pydantic validation with 422 (not 501);
+    # the assertion is the *not-501* half of the contract: as
+    # long as the endpoint behaves like a real handler, the
+    # placeholder contract is dead.
+    response = client.post("/v1/auth/register", json={})
+    assert response.status_code != 501, (
+        "POST /v1/auth/register must be implemented (issue #3), "
+        "not the scaffold 501 placeholder"
+    )

@@ -23,3 +23,16 @@ arq~=0.26
 
 # HTTP client for provider adapters
 httpx~=0.28
+
+# Auth: bcrypt for password / API-key hashing and PyJWT for the
+# dashboard session tokens minted by `POST /v1/auth/login`. Both are
+# pinned with `~=` so a patch update cannot silently flip the
+# hashing algorithm the platform uses to protect client credentials.
+bcrypt~=4.2
+PyJWT~=2.9
+
+# Email validation for the `register` endpoint. The library ships
+# with a vendored list of disposable / free providers so we can
+# reject obvious throwaways at the edge instead of letting them
+# clutter the production database.
+email-validator~=2.2

@@ -232,6 +232,12 @@ EXPECTED_ENV_KEYS: set[str] = {
     "REDIS_HOST",
     "REDIS_PORT",
     "REDIS_DB",
+    # Auth & registration settings (issue #3).
+    "BCRYPT_ROUNDS",
+    "JWT_SECRET",
+    "JWT_ALGORITHM",
+    "JWT_TTL_MINUTES",
+    "API_KEY_PREFIX",
     # Compose project name is consumed by docker-compose itself.
     "COMPOSE_PROJECT_NAME",
     # API_BASE_URL is consumed by the Angular build at image build time.
@@ -681,6 +687,12 @@ REQUIRED_BACKEND_PACKAGES: set[str] = {
     "redis",
     "arq",
     "httpx",
+    # Auth & registration dependencies (issue #3). The
+    # ``_normalise_requirements`` helper lower-cases the names
+    # so we mirror the canonical pip spelling here.
+    "bcrypt",
+    "pyjwt",
+    "email-validator",
 }
 
 

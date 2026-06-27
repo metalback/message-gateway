@@ -8,6 +8,9 @@ pytest~=8.3
 pytest-asyncio~=0.25
 pytest-cov~=6.0
 httpx~=0.28
+# Async SQLite driver used by the in-memory test database
+# (see tests/conftest.py and tests/routes/test_auth.py).
+aiosqlite~=0.20
 
 # Validates docker-compose / CI YAML fixtures in test_infra.py.
 pyyaml~=6.0

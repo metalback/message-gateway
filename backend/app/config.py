@@ -51,6 +51,27 @@ class Settings(BaseSettings):
     def redis_url(self) -> str:
         return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
+    # --- Auth & registration --------------------------------------------
+    # The cost factor used by :mod:`app.services.auth` whenever it
+    # hashes a password or an API key. 12 is the OWASP-recommended
+    # minimum for 2024+; lower in dev / test to keep unit suites
+    # fast (a round=12 hash is ~250 ms on commodity hardware).
+    bcrypt_rounds: int = Field(default=12, alias="BCRYPT_ROUNDS", ge=4, le=15)
+
+    # HMAC secret used to sign the dashboard session JWT. Kept
+    # independent from `secret_key` so a JWT rotation does not
+    # cascade into rotating the rest of the platform's secrets.
+    jwt_secret: str = Field(default="dev-jwt-change-me", alias="JWT_SECRET")
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    # Dashboard session lifetime in minutes.
+    jwt_ttl_minutes: int = Field(default=60, alias="JWT_TTL_MINUTES", ge=1, le=60 * 24 * 7)
+
+    # Public prefix attached to every API key the platform mints.
+    # The default matches the documented integration contract; the
+    # field is exposed so a future "staging" environment can ship
+    # `mgw_test_…` keys without code changes.
+    api_key_prefix: str = Field(default="mgw_live_", alias="API_KEY_PREFIX")
+
     # --- Pydantic config ------------------------------------------------
     # `populate_by_name=True` lets tests instantiate `Settings(field="x")`
     # using the pythonic name even though we expose UPPER_SNAKE env vars.
