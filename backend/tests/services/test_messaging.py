@@ -225,6 +225,58 @@ async def test_send_message_persists_and_returns_outcome(
     ]
 
 
+async def test_send_message_records_latency_ms(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A successful send records the wall-clock duration of the
+    provider call in the ``latency_ms`` column. The field is
+    ``None`` for a failed dispatch so the per-provider average
+    reflects successful round-trips, not the time it took a
+    request to fail."""
+    client = await _make_client(async_session)
+    outcome = await send_message(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        to="+56912345678",
+        body="hola",
+        settings=messaging_settings,
+    )
+    # The fake provider returns immediately, so the
+    # measured latency is a small positive float (a real
+    # call would be in the tens to hundreds of ms range).
+    assert outcome.message.latency_ms is not None
+    assert outcome.message.latency_ms >= 0.0
+    assert outcome.message.latency_ms < 5_000.0  # sanity bound
+
+
+async def test_send_message_leaves_latency_null_on_failure(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A failed dispatch does not populate ``latency_ms``.
+
+    The admin breakdown's ``AVG`` skips ``NULL`` rows, so a
+    failed call that took 10 seconds to fail does not skew the
+    per-provider average. The operator gets a quality-of-
+    service metric (how long does a successful round-trip
+    take?) rather than a mixed signal that conflates success
+    and failure."""
+    fake_providers["meta_whatsapp"]._error = ProviderValidationError(
+        "bad number", provider="meta_whatsapp"
+    )
+    client = await _make_client(async_session)
+    outcome = await send_message(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        to="+56912345678",
+        body="hola",
+        settings=messaging_settings,
+    )
+    assert outcome.message.status == MessageStatus.FAILED
+    assert outcome.message.latency_ms is None
+
+
 async def test_send_message_marks_failed_on_provider_error(
     async_session, fake_providers, messaging_settings
 ) -> None:

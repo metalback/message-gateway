@@ -600,6 +600,7 @@ async def test_admin_provider_breakdown_groups_by_provider(
                 status=MessageStatus.DELIVERED,
                 cost_clp=80,
                 fee_clp=5,
+                latency_ms=150.0,
                 created_at=in_period,
             ),
             Message(
@@ -611,6 +612,7 @@ async def test_admin_provider_breakdown_groups_by_provider(
                 status=MessageStatus.FAILED,
                 cost_clp=80,
                 fee_clp=5,
+                latency_ms=200.0,
                 created_at=in_period,
             ),
             Message(
@@ -637,11 +639,78 @@ async def test_admin_provider_breakdown_groups_by_provider(
     assert meta.failed == 1
     assert meta.cost_clp == 160
     assert meta.fee_clp == 10
+    # ``AVG`` of (150, 200) is 175; the helper wraps the
+    # SQL expression in a Float() cast so the value comes
+    # back as a Python ``float`` regardless of the backend.
+    assert meta.avg_latency_ms == pytest.approx(175.0)
     sms = by_provider["sms_aggregator"]
     assert sms.total == 1
     assert sms.delivered == 1
     assert sms.cost_clp == 25
     assert sms.fee_clp == 3
+    # No ``latency_ms`` recorded on the SMS row, so the
+    # average is ``None`` (the dashboard renders a "—"
+    # placeholder rather than a misleading ``0.0``).
+    assert sms.avg_latency_ms is None
+
+
+async def test_admin_provider_breakdown_avg_latency_ignores_nulls(
+    session: AsyncSession,
+) -> None:
+    """``AVG(latency_ms)`` skips rows with a ``NULL`` value.
+
+    The semantic is the standard SQL one: a bucket with
+    five observed dispatches and one unobserved row
+    reports the mean of the five, not the mean divided by
+    six. The test pins the contract so a future "coalesce
+    ``NULL`` to 0" refactor would fail loudly.
+    """
+    client = await _seed_single_client(session)
+    now = datetime.now(tz=UTC)
+    in_period = now - timedelta(days=2)
+    session.add_all(
+        [
+            Message(
+                client_id=client.id,
+                provider="meta_whatsapp",
+                channel=Channel.WHATSAPP,
+                to_number="+56912345678",
+                body="ok",
+                status=MessageStatus.DELIVERED,
+                latency_ms=100.0,
+                created_at=in_period,
+            ),
+            Message(
+                client_id=client.id,
+                provider="meta_whatsapp",
+                channel=Channel.WHATSAPP,
+                to_number="+56912345679",
+                body="ok",
+                status=MessageStatus.DELIVERED,
+                latency_ms=200.0,
+                created_at=in_period,
+            ),
+            Message(
+                client_id=client.id,
+                provider="meta_whatsapp",
+                channel=Channel.WHATSAPP,
+                to_number="+56912345680",
+                body="ok",
+                status=MessageStatus.DELIVERED,
+                # ``latency_ms`` left as ``None`` (the
+                # default); represents a row that pre-dates
+                # the column.
+                created_at=in_period,
+            ),
+        ]
+    )
+    await session.commit()
+    rows = await admin_service.admin_provider_breakdown(session)
+    assert len(rows) == 1
+    meta = rows[0]
+    assert meta.provider == "meta_whatsapp"
+    # Average of (100, 200) = 150, ignoring the third row.
+    assert meta.avg_latency_ms == pytest.approx(150.0)
 
 
 # ---------------------------------------------------------------------------

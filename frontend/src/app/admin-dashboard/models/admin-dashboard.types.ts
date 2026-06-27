@@ -110,7 +110,14 @@ export interface AdminOverview {
 }
 
 /** A single ``(provider, channel)`` bucket in the
- *  ``GET /v1/admin/stats/by-provider`` response. */
+ *  ``GET /v1/admin/stats/by-provider`` response.
+ *
+ *  ``avg_latency_ms`` is the mean wall-clock duration of
+ *  a successful ``provider.send`` call, in milliseconds,
+ *  across the rows in the bucket. The value is ``null``
+ *  for buckets that have no observed dispatches (a
+ *  freshly-rolled deployment, for example); the
+ *  dashboard renders a "—" placeholder in that case. */
 export interface AdminProviderBreakdownRow {
   readonly provider: string;
   readonly channel: AdminMessageChannel;
@@ -120,6 +127,7 @@ export interface AdminProviderBreakdownRow {
   readonly pending: number;
   readonly cost_clp: number;
   readonly fee_clp: number;
+  readonly avg_latency_ms: number | null;
 }
 
 /** A single row of the admin error log table. */

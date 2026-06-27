@@ -174,7 +174,15 @@ class AdminOverviewResponse(BaseModel):
 
 
 class ProviderBreakdownResponse(BaseModel):
-    """Projection of :class:`ProviderBreakdownRow` for the API."""
+    """Projection of :class:`ProviderBreakdownRow` for the API.
+
+    ``avg_latency_ms`` is the mean wall-clock duration of a
+    successful ``provider.send`` call, in milliseconds,
+    across the rows in the bucket. ``None`` when the bucket
+    has no observed dispatches (a freshly-rolled deployment,
+    for example) so the frontend can render a "—" placeholder
+    rather than a misleading zero.
+    """
 
     provider: str
     channel: str
@@ -184,6 +192,7 @@ class ProviderBreakdownResponse(BaseModel):
     pending: int
     cost_clp: int
     fee_clp: int
+    avg_latency_ms: float | None
 
 
 class ErrorLogResponse(BaseModel):
@@ -524,6 +533,7 @@ async def admin_provider_breakdown_endpoint(
             pending=row.pending,
             cost_clp=row.cost_clp,
             fee_clp=row.fee_clp,
+            avg_latency_ms=row.avg_latency_ms,
         )
         for row in rows
     ]

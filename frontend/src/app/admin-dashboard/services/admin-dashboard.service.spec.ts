@@ -269,6 +269,7 @@ describe('AdminDashboardService', () => {
           pending: 1,
           cost_clp: 800,
           fee_clp: 50,
+          avg_latency_ms: 145.2,
         },
       ];
       let observed: ReadonlyArray<AdminProviderBreakdownRow> | undefined;
@@ -280,6 +281,32 @@ describe('AdminDashboardService', () => {
       expect(req.request.method).toBe('GET');
       req.flush(rows);
       expect(observed).toEqual(rows);
+    });
+
+    it('passes the avg_latency_ms value through to the component', () => {
+      // The service is a thin pass-through; the test pins the
+      // contract so a future refactor that drops the field on
+      // the floor would fail loudly.
+      const rows: AdminProviderBreakdownRow[] = [
+        {
+          provider: 'sms_aggregator',
+          channel: 'sms',
+          total: 5,
+          delivered: 5,
+          failed: 0,
+          pending: 0,
+          cost_clp: 125,
+          fee_clp: 15,
+          avg_latency_ms: null,
+        },
+      ];
+      let observed: ReadonlyArray<AdminProviderBreakdownRow> | undefined;
+      service.getProviderBreakdown().subscribe((value) => (observed = value));
+      const req = http.expectOne(
+        `${environment.apiBaseUrl}/v1/admin/stats/by-provider`,
+      );
+      req.flush(rows);
+      expect(observed?.[0]?.avg_latency_ms).toBeNull();
     });
   });
 

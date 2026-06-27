@@ -38,7 +38,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -212,6 +212,19 @@ class Message(Base):
     )
     sent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # --- Provider metrics ------------------------------------------------
+    # Wall-clock duration of the outbound ``provider.send`` call, in
+    # milliseconds. Populated by the messaging service so the admin
+    # dashboard's "latencia promedio por provider" tile can report the
+    # average round-trip time of a dispatch without an in-process
+    # metric exporter. ``None`` for rows that pre-date the column or
+    # were inserted by a code path that does not measure the call
+    # (e.g. tests, fixtures). The per-provider aggregation treats
+    # ``NULL`` as "skip this row" via the standard ``AVG`` semantics.
+    latency_ms: Mapped[float | None] = mapped_column(
+        Float(), nullable=True
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper

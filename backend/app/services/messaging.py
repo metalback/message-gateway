@@ -79,6 +79,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -615,23 +616,39 @@ def _provider_name_for(channel: Channel, *, settings: Settings) -> str:
 async def _dispatch(
     provider: BaseProvider,
     message: Message,
-) -> SendResult:
-    """Call ``provider.send`` and translate the result.
+) -> tuple[SendResult, float]:
+    """Call ``provider.send`` and time the round-trip.
 
     The helper is kept thin: it returns the provider's
     :class:`SendResult` on success and converts
     :class:`ProviderError` into a :class:`MessagingError` so
     the route layer only has to know about one exception
     hierarchy.
+
+    The companion value is the wall-clock duration of the
+    ``provider.send`` call, in milliseconds. The duration is
+    measured around the awaitable so the time includes every
+    failover iteration the :class:`FailoverProvider` makes
+    on a single dispatch – the column ends up reflecting the
+    *observable* latency the operator sees, not just the time
+    of the last underlying call. A failed dispatch is
+    re-raised without a return value, so the latency is
+    intentionally only recorded on success: the admin
+    breakdown uses the column as a quality-of-service
+    metric, and an average that mixes successful and failed
+    calls would conflate two different signals.
     """
+    started = time.perf_counter()
     try:
-        return await provider.send(to=message.to_number, body=message.body)
+        result = await provider.send(to=message.to_number, body=message.body)
     except ProviderError:
         # The provider layer already classifies the failure
         # (unavailable / validation / rate limit). We re-raise
         # so the route layer can surface the correct HTTP
         # status without re-deriving it from a string.
         raise
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return result, elapsed_ms
 
 
 def _map_provider_status(raw: str) -> MessageStatus:
@@ -707,7 +724,7 @@ async def send_message(
 
     provider = get_provider(channel, settings=cfg)
     try:
-        result: SendResult = await _dispatch(provider, message)
+        result, latency_ms = await _dispatch(provider, message)
     except ProviderError as exc:
         message.status = MessageStatus.FAILED
         message.error_code = exc.code
@@ -728,6 +745,16 @@ async def send_message(
 
     message.status = MessageStatus.SENT
     message.provider_msg_id = result.provider_msg_id
+    # The wall-clock duration of the ``provider.send`` call, in
+    # milliseconds. The admin dashboard's "latencia promedio por
+    # provider" tile groups this column by ``(provider, channel)``
+    # so an operator can spot a slow upstream before the slow
+    # upstream becomes a customer-visible outage. The value is
+    # recorded on the row that actually succeeded: a failed
+    # dispatch is left as ``NULL`` so the average reflects
+    # successful round-trips, not the time it took a request to
+    # fail.
+    message.latency_ms = latency_ms
     # The failover router may have switched providers mid-call;
     # ``result.provider_name`` carries the *actual* upstream that
     # accepted the message so an operator looking at the

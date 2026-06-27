@@ -39,6 +39,12 @@ def test_mensajes_table_is_registered() -> None:
         "fee_clp",
         "created_at",
         "updated_at",
+        # ``latency_ms`` was added with the admin
+        # dashboard's "latencia promedio por provider" tile
+        # (issue #10). The column is nullable and lives
+        # next to ``cost_clp`` / ``fee_clp`` in the model
+        # so a future column rename would surface here.
+        "latency_ms",
     }
     assert expected_columns.issubset(set(table.columns.keys())), table.columns.keys()
 
@@ -129,6 +135,7 @@ async def test_persisted_message_round_trips_through_database(async_session) -> 
         provider_msg_id="agg-1234",
         cost_clp=25,
         fee_clp=3,
+        latency_ms=185.0,
     )
     async_session.add(message)
     await async_session.commit()
@@ -143,3 +150,7 @@ async def test_persisted_message_round_trips_through_database(async_session) -> 
     assert loaded.cost_clp == 25
     assert loaded.fee_clp == 3
     assert loaded.to_number == "+56912345678"
+    # The wall-clock duration of the dispatch round-trip
+    # round-trips through the ORM. ``None`` for a row
+    # that pre-dates the column.
+    assert loaded.latency_ms == 185.0

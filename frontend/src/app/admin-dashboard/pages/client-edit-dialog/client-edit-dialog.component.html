@@ -1,0 +1,180 @@
+<div
+  *ngIf="open"
+  class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50 px-4 py-6"
+  data-testid="client-edit-dialog-backdrop"
+  (click)="onCancel()"
+>
+  <div
+    class="w-full max-w-2xl overflow-hidden rounded-lg bg-white shadow-xl"
+    role="dialog"
+    aria-modal="true"
+    data-testid="client-edit-dialog"
+    (click)="$event.stopPropagation()"
+  >
+    <header class="border-b border-slate-200 px-6 py-4">
+      <h2 class="text-lg font-semibold text-slate-900">
+        {{ isCreateMode ? 'Crear cliente' : 'Editar cliente' }}
+      </h2>
+      <p class="mt-1 text-xs text-slate-500">
+        {{
+          isCreateMode
+            ? 'Genera una nueva cuenta con plan Starter por defecto. La API key se muestra solo una vez.'
+            : 'Actualiza el plan, estado o pricing overrides del cliente seleccionado.'
+        }}
+      </p>
+    </header>
+
+    <form
+      [formGroup]="form"
+      (ngSubmit)="onSubmit()"
+      class="grid grid-cols-1 gap-4 px-6 py-5 sm:grid-cols-2"
+      data-testid="client-edit-form"
+      novalidate
+    >
+      <label class="text-xs text-slate-600 sm:col-span-2">
+        <span class="block">Nombre</span>
+        <input
+          type="text"
+          formControlName="name"
+          maxlength="200"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-name"
+        />
+      </label>
+
+      <label class="text-xs text-slate-600" *ngIf="isCreateMode">
+        <span class="block">Email</span>
+        <input
+          type="email"
+          formControlName="email"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-email"
+        />
+      </label>
+
+      <label class="text-xs text-slate-600" *ngIf="isCreateMode">
+        <span class="block">RUT</span>
+        <input
+          type="text"
+          formControlName="rut"
+          maxlength="20"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-rut"
+        />
+      </label>
+
+      <label class="text-xs text-slate-600 sm:col-span-2" *ngIf="isCreateMode">
+        <span class="block">Contraseña inicial</span>
+        <input
+          type="password"
+          formControlName="password"
+          maxlength="255"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-password"
+        />
+      </label>
+
+      <label class="text-xs text-slate-600">
+        <span class="block">Plan</span>
+        <select
+          formControlName="plan"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-plan"
+        >
+          <option *ngFor="let plan of plans" [value]="plan">
+            {{ planLabel(plan) }}
+          </option>
+        </select>
+      </label>
+
+      <label class="text-xs text-slate-600" *ngIf="!isCreateMode">
+        <span class="block">Estado</span>
+        <select
+          formControlName="status"
+          class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+          data-testid="field-status"
+        >
+          <option *ngFor="let status of statuses" [value]="status">
+            {{ statusLabel(status) }}
+          </option>
+        </select>
+      </label>
+
+      <fieldset class="sm:col-span-2 rounded-md border border-slate-200 p-3">
+        <legend class="px-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+          Configuración de precios
+        </legend>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label class="text-xs text-slate-600">
+            <span class="block">Markup porcentual</span>
+            <input
+              type="number"
+              formControlName="markup_percent"
+              min="0"
+              max="10"
+              step="0.01"
+              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+              data-testid="field-markup-percent"
+            />
+            <span class="mt-1 block text-[10px] text-slate-500">
+              Fracción sobre el costo del proveedor (0.25 = 25%).
+            </span>
+          </label>
+          <label class="text-xs text-slate-600">
+            <span class="block">Markup fijo (CLP / msg)</span>
+            <input
+              type="number"
+              formControlName="markup_fixed_clp"
+              min="0"
+              max="1000000"
+              step="1"
+              class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+              data-testid="field-markup-fixed"
+            />
+            <span class="mt-1 block text-[10px] text-slate-500">
+              Recargo fijo en CLP por mensaje facturable.
+            </span>
+          </label>
+        </div>
+      </fieldset>
+
+      <div
+        *ngIf="createdApiKey"
+        class="sm:col-span-2 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-700"
+        data-testid="created-api-key"
+      >
+        <p class="font-semibold">Cliente creado. Copia la API key, no se mostrará de nuevo:</p>
+        <code class="mt-1 block break-all font-mono text-[11px]">{{ createdApiKey }}</code>
+      </div>
+
+      <p
+        *ngIf="errorMessage"
+        class="sm:col-span-2 rounded-md border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700"
+        role="alert"
+        data-testid="dialog-error"
+      >
+        {{ errorMessage }}
+      </p>
+
+      <div class="sm:col-span-2 flex items-center justify-end gap-2 border-t border-slate-200 pt-4">
+        <button
+          type="button"
+          (click)="onCancel()"
+          [disabled]="submitting"
+          class="rounded-md border border-slate-300 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+          data-testid="cancel-button"
+        >
+          Cancelar
+        </button>
+        <button
+          type="submit"
+          [disabled]="submitting || form.invalid"
+          class="rounded-md bg-brand-600 px-3 py-2 text-xs font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
+          data-testid="submit-button"
+        >
+          {{ submitting ? 'Guardando…' : (isCreateMode ? 'Crear cliente' : 'Guardar cambios') }}
+        </button>
+      </div>
+    </form>
+  </div>
+</div>

@@ -41,7 +41,10 @@ Public functions:
   messages this month, monthly revenue in CLP, per-channel
   delivered/failed/pending counts).
 - :func:`admin_provider_breakdown` – per-provider aggregates
-  for the "desglose por proveedor" card.
+  for the "desglose por proveedor" card. The bucket
+  includes the mean ``latency_ms`` of every successful
+  dispatch so the dashboard's "latencia promedio por
+  provider" tile can render without a second round-trip.
 - :func:`list_recent_errors`     – paginated read of the most
   recent :class:`~app.models.message.Message` rows whose
   status is :attr:`MessageStatus.FAILED` (the "logs de
@@ -207,6 +210,15 @@ class ProviderBreakdownRow:
     Counts and sums are aggregated over the current
     calendar month by default; the dashboard uses the
     value to drive the per-provider bar chart.
+
+    ``avg_latency_ms`` is the mean wall-clock duration of
+    a successful ``provider.send`` call, in milliseconds,
+    computed across every row in the bucket that has a
+    non-``NULL`` ``mensajes.latency_ms`` value. The field
+    is ``None`` for buckets where every row is still
+    unobserved (a freshly-rolled deployment) so the
+    dashboard can render a "—" placeholder rather than a
+    misleading ``0``.
     """
 
     provider: str
@@ -217,6 +229,7 @@ class ProviderBreakdownRow:
     pending: int
     cost_clp: int
     fee_clp: int
+    avg_latency_ms: float | None
 
 
 @dataclass(frozen=True)
@@ -666,6 +679,15 @@ async def admin_provider_breakdown(
     columns are summed across the same period as the
     message counts so the per-provider revenue is
     apples-to-apples with the overview card.
+
+    ``avg_latency_ms`` is the arithmetic mean of the
+    ``latency_ms`` column over the same group, ignoring
+    ``NULL`` rows (the standard SQL ``AVG`` semantics).
+    The query is wrapped in a ``CAST(... AS Float)`` so
+    the result comes back as a float on every backend
+    SQLAlchemy supports – SQLite returns a ``Decimal``
+    by default and the dataclass field is typed
+    ``float | None`` to keep the wire shape stable.
     """
     now = period or datetime.now(tz=UTC)
     period_start, period_end = _month_bounds(now)
@@ -701,6 +723,7 @@ async def admin_provider_breakdown(
             ).label("pending"),
             func.coalesce(func.sum(Message.cost_clp), 0).label("cost_clp"),
             func.coalesce(func.sum(Message.fee_clp), 0).label("fee_clp"),
+            func.avg(Message.latency_ms).label("avg_latency_ms"),
         )
         .where(
             and_(
@@ -723,6 +746,11 @@ async def admin_provider_breakdown(
             pending=int(row.pending or 0),
             cost_clp=int(row.cost_clp or 0),
             fee_clp=int(row.fee_clp or 0),
+            avg_latency_ms=(
+                float(row.avg_latency_ms)
+                if row.avg_latency_ms is not None
+                else None
+            ),
         )
         for row in rows
     )

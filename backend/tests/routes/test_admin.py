@@ -583,6 +583,12 @@ def test_admin_provider_breakdown_groups_by_provider(
     assert row["total"] == 3
     assert row["delivered"] == 1
     assert row["failed"] == 2
+    # The ``avg_latency_ms`` field is part of the wire
+    # contract; the seeded messages do not record a
+    # latency (the fixture predates the column), so the
+    # field is exposed as ``null`` rather than omitted.
+    assert "avg_latency_ms" in row
+    assert row["avg_latency_ms"] is None
 
 
 # ---------------------------------------------------------------------------
