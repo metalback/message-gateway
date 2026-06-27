@@ -14,6 +14,11 @@ The tests cover:
 - :func:`app.services.messaging.get_message_status` – the
   status refresh path, including the cross-tenant access
   guard.
+- :func:`app.services.messaging.list_messages` – the
+  paginated / filterable history used by the dashboard's
+  "Historial y consumo" view, including the cross-tenant
+  guard, the ``channel`` / ``status`` / date range filters
+  and the ``has_more`` / ``total`` accounting.
 
 The HTTP layer is exercised through the
 :class:`FakeProvider` so the suite never opens a real TCP
@@ -24,6 +29,7 @@ the test inject the response it wants to simulate.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -39,10 +45,15 @@ from app.models.client import Client, ClientPlan, ClientStatus
 from app.models.message import Channel, Message, MessageStatus
 from app.services.messaging import (
     BatchTooLargeError,
+    InvalidListFilterError,
     InvalidMessageError,
     MessageNotFoundError,
     compute_message_cost,
+    daily_message_counts,
     get_message_status,
+    iter_messages_for_export,
+    list_messages,
+    render_messages_csv,
     send_batch,
     send_message,
 )
@@ -656,3 +667,908 @@ async def test_get_message_status_does_not_leak_other_clients(
             message_id=foreign.id,
             settings=messaging_settings,
         )
+
+
+# ---------------------------------------------------------------------------
+# list_messages
+# ---------------------------------------------------------------------------
+
+
+async def _seed_message(
+    async_session,
+    *,
+    client_id: str,
+    channel: Channel,
+    status: MessageStatus,
+    created_at: datetime,
+    body: str = "hola",
+) -> Message:
+    """Insert a single :class:`Message` row for the history tests.
+
+    The helper isolates the fields the ``list_messages`` path
+    actually reads (``client_id``, ``channel``, ``status``,
+    ``created_at``); the rest fall back to the model's
+    defaults. ``provider`` is set explicitly because the
+    column is non-nullable and the test does not care about
+    the value.
+    """
+    message = Message(
+        client_id=client_id,
+        provider="meta_whatsapp" if channel is Channel.WHATSAPP else "sms_aggregator",
+        channel=channel,
+        to_number="+56912345678",
+        body=body,
+        status=status,
+        cost_clp=0,
+        fee_clp=0,
+        created_at=created_at,
+    )
+    async_session.add(message)
+    await async_session.commit()
+    return message
+
+
+async def test_list_messages_returns_newest_first(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The history is ordered by ``created_at`` descending so
+    the dashboard does not have to re-sort on the client. The
+    test seeds three rows with deterministic timestamps and
+    asserts the response order matches the descending order.
+    """
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    newest = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    middle = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.WHATSAPP,
+        status=MessageStatus.DELIVERED,
+        created_at=now - timedelta(minutes=5),
+    )
+    oldest = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.FAILED,
+        created_at=now - timedelta(hours=1),
+    )
+
+    page = await list_messages(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert [m.id for m in page.items] == [newest.id, middle.id, oldest.id]
+    assert page.total == 3
+    assert page.has_more is False
+    assert page.limit == 50
+    assert page.offset == 0
+
+
+async def test_list_messages_filters_by_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The ``channel`` filter narrows the result set to the
+    single channel the dashboard's filter chip selected. The
+    test pins the SQL semantics so a refactor cannot silently
+    start returning rows from the other channel."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    keep = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.WHATSAPP,
+        status=MessageStatus.SENT,
+        created_at=now - timedelta(minutes=1),
+    )
+
+    page = await list_messages(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        settings=messaging_settings,
+    )
+    assert [m.id for m in page.items] == [keep.id]
+    assert page.total == 1
+
+
+async def test_list_messages_filters_by_status(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The ``status`` filter narrows the result set to a single
+    :class:`MessageStatus`. The test exercises a non-default
+    status (``FAILED``) so the assertion cannot be satisfied
+    by accident by a "match anything" implementation."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    failed = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.FAILED,
+        created_at=now - timedelta(minutes=1),
+    )
+
+    page = await list_messages(
+        async_session,
+        client=client,
+        status=MessageStatus.FAILED,
+        settings=messaging_settings,
+    )
+    assert [m.id for m in page.items] == [failed.id]
+    assert page.total == 1
+
+
+async def test_list_messages_filters_by_date_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """``since`` and ``until`` are inclusive bounds on
+    ``created_at``. The test seeds one message inside the
+    window, one before, one after, and asserts only the
+    in-window row is returned."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    inside = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now - timedelta(days=3),
+    )
+    await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now + timedelta(days=3),
+    )
+
+    page = await list_messages(
+        async_session,
+        client=client,
+        since=now - timedelta(hours=1),
+        until=now + timedelta(hours=1),
+        settings=messaging_settings,
+    )
+    assert [m.id for m in page.items] == [inside.id]
+    assert page.total == 1
+
+
+async def test_list_messages_pagination_has_more_and_total(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """``has_more`` is ``True`` when there is at least one
+    additional row after the current page, ``False``
+    otherwise. The test seeds 7 rows and pages through them
+    with a ``limit`` of 3 to exercise the boundary on every
+    page.
+    """
+    client = await _make_client(async_session)
+    base = datetime.now(tz=UTC)
+    for i in range(7):
+        await _seed_message(
+            async_session,
+            client_id=client.id,
+            channel=Channel.SMS,
+            status=MessageStatus.SENT,
+            created_at=base - timedelta(minutes=i),
+        )
+
+    first = await list_messages(
+        async_session, client=client, limit=3, offset=0, settings=messaging_settings
+    )
+    assert len(first.items) == 3
+    assert first.total == 7
+    assert first.has_more is True
+
+    second = await list_messages(
+        async_session, client=client, limit=3, offset=3, settings=messaging_settings
+    )
+    assert len(second.items) == 3
+    assert second.has_more is True
+
+    last = await list_messages(
+        async_session, client=client, limit=3, offset=6, settings=messaging_settings
+    )
+    assert len(last.items) == 1
+    assert last.has_more is False
+    assert last.total == 7
+
+
+async def test_list_messages_does_not_leak_other_clients(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A second client's history must not bleed into the first
+    client's page. The test seeds 3 rows for ``other`` and 2
+    rows for ``me`` and asserts the call from ``me`` only
+    returns ``me``'s rows (and the ``total`` count reflects
+    the same).
+    """
+    other = Client(
+        name="Other",
+        email="other@acme.cl",
+        rut="98765432-1",
+        password_hash="hashed",
+        api_key_hash="also-hashed",
+        api_key_last4="abcd",
+        plan=ClientPlan.STARTER,
+        status=ClientStatus.ACTIVE,
+    )
+    async_session.add(other)
+    await async_session.commit()
+    me = await _make_client(async_session)
+
+    now = datetime.now(tz=UTC)
+    for i in range(3):
+        await _seed_message(
+            async_session,
+            client_id=other.id,
+            channel=Channel.SMS,
+            status=MessageStatus.SENT,
+            created_at=now - timedelta(minutes=i),
+        )
+    for i in range(2):
+        await _seed_message(
+            async_session,
+            client_id=me.id,
+            channel=Channel.SMS,
+            status=MessageStatus.SENT,
+            created_at=now - timedelta(minutes=10 + i),
+        )
+
+    page = await list_messages(
+        async_session, client=me, settings=messaging_settings
+    )
+    assert page.total == 2
+    assert {m.client_id for m in page.items} == {me.id}
+
+
+async def test_list_messages_rejects_unknown_channel_filter(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A ``channel`` value the platform does not know about
+    surfaces as :class:`InvalidListFilterError` so the route
+    layer can map it onto a 422 instead of silently returning
+    an empty list."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await list_messages(
+            async_session,
+            client=client,
+            channel="carrier-pigeon",
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_channel"
+
+
+async def test_list_messages_rejects_unknown_status_filter(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A ``status`` value the platform does not know about
+    surfaces as :class:`InvalidListFilterError`."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await list_messages(
+            async_session,
+            client=client,
+            status="teleported",
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_status"
+
+
+async def test_list_messages_rejects_inverted_date_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """``since`` must be earlier than (or equal to) ``until``;
+    a range where the lower bound is after the upper bound is
+    a 422. The test pins the contract so a future "swap the
+    bounds silently" refactor does not slip through."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await list_messages(
+            async_session,
+            client=client,
+            since=now,
+            until=now - timedelta(days=1),
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_date_range"
+
+
+async def test_list_messages_rejects_non_positive_limit(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A ``limit`` of zero (or a negative value) is rejected at
+    the service layer so a buggy dashboard cannot accidentally
+    request an empty page."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await list_messages(
+            async_session,
+            client=client,
+            limit=0,
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_limit"
+
+
+async def test_list_messages_caps_limit_to_hard_maximum(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The service silently caps ``limit`` at the hard
+    maximum so a curious operator cannot ask the API for an
+    unbounded page. The dashboard does not currently send
+    values above the cap, but the cap protects against a
+    future regression in the call site."""
+    from app.services.messaging import _LIST_HARD_LIMIT
+
+    client = await _make_client(async_session)
+    page = await list_messages(
+        async_session,
+        client=client,
+        limit=_LIST_HARD_LIMIT * 5,
+        settings=messaging_settings,
+    )
+    assert page.limit == _LIST_HARD_LIMIT
+
+
+async def test_list_messages_empty_history_returns_empty_page(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A customer who has never sent a message gets a
+    well-formed empty page (``items=[]``, ``total=0``,
+    ``has_more=False``) so the dashboard can render an
+    "empty state" without special-casing the API."""
+    client = await _make_client(async_session)
+    page = await list_messages(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert page.items == []
+    assert page.total == 0
+    assert page.has_more is False
+
+
+# ---------------------------------------------------------------------------
+# iter_messages_for_export + render_messages_csv
+# ---------------------------------------------------------------------------
+#
+# The "Historial y consumo" dashboard lets the customer download
+# their history as a CSV file (PRD user story #18). The
+# service-layer entry point is :func:`iter_messages_for_export` and
+# the wire format is owned by :func:`render_messages_csv`. The
+# tests below pin both contracts so a refactor in either half does
+# not silently change the file a customer downloads.
+
+
+async def test_iter_messages_for_export_returns_full_history(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A small history is returned in full, newest first, with
+    the right ``total`` count and a ``truncated=False`` flag
+    (the result is well under the hard cap). The test seeds
+    three rows with deterministic timestamps and asserts the
+    ordering and the count."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    newest = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    middle = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.WHATSAPP,
+        status=MessageStatus.DELIVERED,
+        created_at=now - timedelta(minutes=5),
+    )
+    oldest = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.FAILED,
+        created_at=now - timedelta(minutes=10),
+    )
+
+    export = await iter_messages_for_export(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert [m.id for m in export.items] == [newest.id, middle.id, oldest.id]
+    assert export.total == 3
+    assert export.truncated is False
+
+
+async def test_iter_messages_for_export_respects_filters(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The export honours the same ``channel`` / ``status`` /
+    date range filters the list endpoint does. The test seeds
+    one WhatsApp / one SMS row and asks for WhatsApp only;
+    the result is the single WhatsApp row."""
+    client = await _make_client(async_session)
+    now = datetime.now(tz=UTC)
+    await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now,
+    )
+    keep = await _seed_message(
+        async_session,
+        client_id=client.id,
+        channel=Channel.WHATSAPP,
+        status=MessageStatus.SENT,
+        created_at=now - timedelta(minutes=1),
+    )
+
+    export = await iter_messages_for_export(
+        async_session,
+        client=client,
+        channel=Channel.WHATSAPP,
+        settings=messaging_settings,
+    )
+    assert [m.id for m in export.items] == [keep.id]
+    assert export.total == 1
+
+
+async def test_iter_messages_for_export_does_not_leak_other_clients(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The export must be tenant-scoped, exactly like
+    :func:`list_messages`. The test seeds two rows for a
+    second client and one row for ``me`` and asserts only
+    ``me``'s row is in the result."""
+    other = Client(
+        name="Other",
+        email="other@acme.cl",
+        rut="98765432-1",
+        password_hash="hashed",
+        api_key_hash="also-hashed",
+        api_key_last4="abcd",
+        plan=ClientPlan.STARTER,
+        status=ClientStatus.ACTIVE,
+    )
+    async_session.add(other)
+    await async_session.commit()
+    me = await _make_client(async_session)
+
+    now = datetime.now(tz=UTC)
+    for i in range(2):
+        await _seed_message(
+            async_session,
+            client_id=other.id,
+            channel=Channel.SMS,
+            status=MessageStatus.SENT,
+            created_at=now - timedelta(minutes=i),
+        )
+    mine = await _seed_message(
+        async_session,
+        client_id=me.id,
+        channel=Channel.SMS,
+        status=MessageStatus.SENT,
+        created_at=now - timedelta(minutes=10),
+    )
+
+    export = await iter_messages_for_export(
+        async_session, client=me, settings=messaging_settings
+    )
+    assert [m.id for m in export.items] == [mine.id]
+    assert export.total == 1
+
+
+async def test_iter_messages_for_export_marks_truncated_when_capped(
+    async_session, fake_providers, messaging_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the result would exceed :data:`_EXPORT_HARD_LIMIT`
+    rows the service returns the cap-sized slice and flips
+    ``truncated=True`` so the route layer can surface a
+    header. The test lowers the cap to a small number so the
+    assertion does not have to seed thousands of rows."""
+    from app.services import messaging as messaging_module
+
+    monkeypatch.setattr(messaging_module, "_EXPORT_HARD_LIMIT", 2)
+    client = await _make_client(async_session)
+    base = datetime.now(tz=UTC)
+    for i in range(3):
+        await _seed_message(
+            async_session,
+            client_id=client.id,
+            channel=Channel.SMS,
+            status=MessageStatus.SENT,
+            created_at=base - timedelta(minutes=i),
+        )
+
+    export = await iter_messages_for_export(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert len(export.items) == 2
+    assert export.total == 3
+    assert export.truncated is True
+
+
+def test_render_messages_csv_includes_header_and_rows() -> None:
+    """The wire format is the standard RFC-4180 CSV: a header
+    row, one row per message, and a ``\\r\\n`` line terminator.
+    The test builds a small in-memory :class:`Message` and
+    asserts the exact byte-for-byte output so a refactor in
+    the column shape (or a stray ``\\n``) is caught here
+    rather than at a customer's spreadsheet."""
+    from app.models.message import Message as MessageModel
+
+    message = MessageModel(
+        id="m-1",
+        client_id="c-1",
+        provider="meta_whatsapp",
+        channel=Channel.WHATSAPP,
+        to_number="+56912345678",
+        body='hola "amigo"',
+        status=MessageStatus.DELIVERED,
+        provider_msg_id="p-1",
+        cost_clp=80,
+        fee_clp=5,
+        created_at=datetime(2026, 6, 15, 10, 0, tzinfo=UTC),
+    )
+    rendered = render_messages_csv([message])
+    expected = (
+        "id,created_at,channel,status,to_number,body,provider,"
+        "provider_msg_id,error_code,error_message,cost_clp,fee_clp\r\n"
+        'm-1,2026-06-15T10:00:00+00:00,whatsapp,delivered,+56912345678,'
+        '"hola ""amigo""",meta_whatsapp,p-1,,,80,5\r\n'
+    )
+    assert rendered == expected
+
+
+def test_render_messages_csv_handles_empty_iterable() -> None:
+    """An empty input still produces a well-formed CSV with
+    just the header row, so the route layer never has to
+    branch on ``items=[]``."""
+    rendered = render_messages_csv([])
+    assert rendered == (
+        "id,created_at,channel,status,to_number,body,provider,"
+        "provider_msg_id,error_code,error_message,cost_clp,fee_clp\r\n"
+    )
+
+
+def test_render_messages_csv_emits_empty_cells_for_optional_fields() -> None:
+    """A row whose ``provider_msg_id`` / ``error_code`` /
+    ``error_message`` are ``None`` must serialise as empty
+    cells – not the literal ``"None"`` ``str(None)`` would
+    produce. A spreadsheet that opens a CSV with ``None``
+    strings in the cells looks like garbage to the customer.
+    """
+    from app.models.message import Message as MessageModel
+
+    message = MessageModel(
+        id="m-2",
+        client_id="c-1",
+        provider="sms_aggregator",
+        channel=Channel.SMS,
+        to_number="+56987654321",
+        body="hola",
+        status=MessageStatus.FAILED,
+        provider_msg_id=None,
+        error_code="rate_limited",
+        error_message="too many",
+        cost_clp=25,
+        fee_clp=5,
+        created_at=datetime(2026, 6, 16, 12, 30, tzinfo=UTC),
+    )
+    rendered = render_messages_csv([message])
+    # The provider_msg_id column is empty; the error columns
+    # carry the values.
+    row = rendered.splitlines()[1]
+    assert row.endswith(",rate_limited,too many,25,5")
+    # No literal ``None`` in the row – a quick safety net
+    # against an accidental ``str(None)`` regression.
+    assert "None" not in row
+
+
+# ---------------------------------------------------------------------------
+# daily_message_counts
+# ---------------------------------------------------------------------------
+#
+# The "Historial y consumo" dashboard's bar chart is backed by
+# :func:`daily_message_counts`. The tests pin the aggregation
+# contract: per-day, per-channel counts, ordered by day, the
+# cross-tenant guard, the date range filters and the error
+# paths. The function is pure database, so the seed
+# pattern matches the rest of the list-messaging tests.
+
+
+async def _seed_message_at(
+    async_session,
+    *,
+    client_id: str,
+    channel: Channel,
+    status: MessageStatus,
+    when: datetime,
+    body: str = "hola",
+) -> Message:
+    """Same helper as :func:`_seed_message` but lets the test
+    pin a specific ``created_at`` *and* propagate the value
+    to ``sent_at`` so the date-based aggregations can use
+    either field interchangeably.
+    """
+    message = Message(
+        client_id=client_id,
+        provider="meta_whatsapp" if channel is Channel.WHATSAPP else "sms_aggregator",
+        channel=channel,
+        to_number="+56912345678",
+        body=body,
+        status=status,
+        cost_clp=0,
+        fee_clp=0,
+        created_at=when,
+        sent_at=when,
+    )
+    async_session.add(message)
+    await async_session.commit()
+    return message
+
+
+async def test_daily_message_counts_groups_by_day_and_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """Two SMS messages on Monday, three WhatsApp messages on
+    Tuesday and one SMS on Tuesday produce three :class:`DailyMessageCount`
+    rows: ``(mon, sms, 2)``, ``(tue, sms, 1)`` and
+    ``(tue, whatsapp, 3)``. The function never collapses
+    channels into a single row per day, so the dashboard
+    can colour the stacked bars without a second query."""
+    client = await _make_client(async_session)
+    monday = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    tuesday = monday + timedelta(days=1)
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=monday,
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=monday + timedelta(hours=1),
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=tuesday,
+    )
+    for i in range(3):
+        await _seed_message_at(
+            async_session, client_id=client.id, channel=Channel.WHATSAPP,
+            status=MessageStatus.SENT, when=tuesday + timedelta(minutes=i),
+        )
+
+    rows = await daily_message_counts(
+        async_session,
+        client=client,
+        since=monday - timedelta(days=1),
+        until=tuesday + timedelta(days=1),
+        settings=messaging_settings,
+    )
+    # Three buckets, ordered by day then channel.
+    assert [(r.day, r.channel, r.count) for r in rows.items] == [
+        (monday.date(), "sms", 2),
+        (tuesday.date(), "sms", 1),
+        (tuesday.date(), "whatsapp", 3),
+    ]
+    # The resolved window is echoed back so the route layer
+    # can put it in the response.
+    assert rows.since == monday - timedelta(days=1)
+    assert rows.until == tuesday + timedelta(days=1)
+
+
+async def test_daily_message_counts_does_not_leak_other_clients(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The aggregation is tenant-scoped, just like
+    :func:`list_messages`. The test seeds a row for a second
+    customer and asserts the second customer's day does not
+    appear in the response."""
+    other = Client(
+        name="Other",
+        email="other@acme.cl",
+        rut="98765432-1",
+        password_hash="hashed",
+        api_key_hash="also-hashed",
+        api_key_last4="abcd",
+        plan=ClientPlan.STARTER,
+        status=ClientStatus.ACTIVE,
+    )
+    async_session.add(other)
+    await async_session.commit()
+    me = await _make_client(async_session)
+
+    when = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    await _seed_message_at(
+        async_session, client_id=other.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=when,
+    )
+    await _seed_message_at(
+        async_session, client_id=me.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=when,
+    )
+
+    rows = await daily_message_counts(
+        async_session,
+        client=me,
+        since=when - timedelta(days=1),
+        until=when + timedelta(days=1),
+        settings=messaging_settings,
+    )
+    assert len(rows.items) == 1
+    assert rows.items[0].count == 1
+    assert rows.items[0].day == when.date()
+    assert rows.items[0].channel == "sms"
+
+
+async def test_daily_message_counts_filters_by_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """The ``channel`` filter narrows the result to a single
+    channel. The test seeds both channels and asks for
+    WhatsApp only; the SMS row never makes it into the
+    response."""
+    client = await _make_client(async_session)
+    when = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=when,
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.WHATSAPP,
+        status=MessageStatus.SENT, when=when,
+    )
+
+    rows = await daily_message_counts(
+        async_session,
+        client=client,
+        since=when - timedelta(days=1),
+        until=when + timedelta(days=1),
+        channel=Channel.WHATSAPP,
+        settings=messaging_settings,
+    )
+    assert len(rows.items) == 1
+    assert rows.items[0].day == when.date()
+    assert rows.items[0].channel == "whatsapp"
+    assert rows.items[0].count == 1
+
+
+async def test_daily_message_counts_uses_default_window_when_unset(
+    async_session, fake_providers, messaging_settings, monkeypatch
+) -> None:
+    """When the caller omits both ``since`` and ``until`` the
+    function falls back to a 31-day window ending "now". The
+    test pins ``now`` to a deterministic instant via a
+    monkey-patched module function and seeds one row inside
+    the window plus one outside, asserting only the in-window
+    row is returned."""
+    from app.services import messaging as messaging_module
+
+    fixed_now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        messaging_module,
+        "_daily_default_range",
+        lambda now=None: (fixed_now - timedelta(days=30), fixed_now),
+    )
+    client = await _make_client(async_session)
+    inside = await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=fixed_now - timedelta(days=2),
+    )
+    await _seed_message_at(
+        async_session, client_id=client.id, channel=Channel.SMS,
+        status=MessageStatus.SENT, when=fixed_now - timedelta(days=60),
+    )
+
+    rows = await daily_message_counts(
+        async_session, client=client, settings=messaging_settings
+    )
+    assert len(rows.items) == 1
+    assert rows.items[0].count == 1
+    assert rows.items[0].day == inside.created_at.date()
+    # The default window is echoed back so the dashboard can
+    # render the chart axis labels.
+    assert rows.since == fixed_now - timedelta(days=30)
+    assert rows.until == fixed_now
+
+
+async def test_daily_message_counts_rejects_inverted_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """An inverted ``since`` / ``until`` is rejected with a
+    422-friendly :class:`InvalidListFilterError` so the
+    dashboard can surface a useful inline error."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await daily_message_counts(
+            async_session,
+            client=client,
+            since=datetime(2030, 1, 1, tzinfo=UTC),
+            until=datetime(2020, 1, 1, tzinfo=UTC),
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_date_range"
+
+
+async def test_daily_message_counts_rejects_oversized_range(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A range wider than the hard cap is rejected before the
+    database is hit so a curious operator cannot force a
+    full-table aggregation."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await daily_message_counts(
+            async_session,
+            client=client,
+            since=datetime(2020, 1, 1, tzinfo=UTC),
+            until=datetime(2026, 1, 1, tzinfo=UTC),
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_date_range"
+
+
+async def test_daily_message_counts_empty_history_returns_empty_list(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A customer who has never sent a message gets a well-
+    formed empty list so the dashboard can render the
+    "todavía no has enviado mensajes este mes" empty state
+    without a special-case branch."""
+    client = await _make_client(async_session)
+    rows = await daily_message_counts(
+        async_session,
+        client=client,
+        since=datetime(2026, 6, 1, tzinfo=UTC),
+        until=datetime(2026, 6, 30, tzinfo=UTC),
+        settings=messaging_settings,
+    )
+    assert rows.items == []
+    assert rows.since == datetime(2026, 6, 1, tzinfo=UTC)
+    assert rows.until == datetime(2026, 6, 30, tzinfo=UTC)
+
+
+async def test_daily_message_counts_rejects_unknown_channel(
+    async_session, fake_providers, messaging_settings
+) -> None:
+    """A bogus channel string is a 422 (not a silent empty
+    list) so a typo in a future caller surfaces immediately."""
+    client = await _make_client(async_session)
+    with pytest.raises(InvalidListFilterError) as exc:
+        await daily_message_counts(
+            async_session,
+            client=client,
+            channel="carrier-pigeon",
+            settings=messaging_settings,
+        )
+    assert exc.value.code == "invalid_channel"
+

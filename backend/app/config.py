@@ -198,7 +198,6 @@ class Settings(BaseSettings):
         default="2024-01-01", alias="DTE_RESOLUTION_DATE"
     )
     dte_sii_office: str = Field(default="Santiago Oriente", alias="DTE_SII_OFFICE")
-    )
 
     # --- Pydantic config ------------------------------------------------
     # `populate_by_name=True` lets tests instantiate `Settings(field="x")`

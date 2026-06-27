@@ -1,0 +1,385 @@
+<section class="mx-auto max-w-6xl px-6 py-8">
+  <header class="mb-8 flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-semibold text-slate-900">Historial y consumo</h1>
+      <p class="mt-1 text-sm text-slate-600">
+        Revisa los mensajes enviados este mes y el saldo de tu plan.
+      </p>
+    </div>
+    <a
+      routerLink="/"
+      class="text-sm font-medium text-brand-600 hover:text-brand-700"
+    >
+      ← Volver al inicio
+    </a>
+  </header>
+
+  <!-- Balance summary card -->
+  <article
+    *ngIf="balance as summary; else balanceSkeleton"
+    class="mb-8 rounded-lg border border-slate-200 bg-white p-6 shadow-sm"
+    data-testid="balance-card"
+  >
+    <div class="flex flex-wrap items-baseline justify-between gap-4">
+      <div>
+        <h2 class="text-sm font-medium uppercase tracking-wide text-slate-500">
+          Plan {{ summary.plan_name }}
+        </h2>
+        <p class="mt-2 text-3xl font-semibold text-slate-900">
+          {{ summary.used_msgs | number }}
+          <span class="text-base font-normal text-slate-500">
+            / {{ summary.msg_limit !== null ? (summary.msg_limit | number) : '∞' }} mensajes
+          </span>
+        </p>
+        <p class="mt-1 text-xs text-slate-500">
+          Período {{ summary.period_start }} – {{ summary.period_end }}
+        </p>
+      </div>
+      <dl class="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
+        <dt class="text-slate-500">Facturables</dt>
+        <dd class="text-right font-medium text-slate-900">
+          {{ summary.billable_msgs | number }}
+        </dd>
+        <dt class="text-slate-500">Excedente</dt>
+        <dd class="text-right font-medium text-slate-900">
+          {{ summary.overage_msgs | number }}
+        </dd>
+        <dt class="text-slate-500">Costo excedente</dt>
+        <dd class="text-right font-medium text-slate-900">
+          ${{ summary.overage_cost_clp | number }}
+        </dd>
+        <dt class="text-slate-500">Total estimado</dt>
+        <dd class="text-right text-base font-semibold text-brand-700">
+          ${{ summary.estimated_total_clp | number }}
+        </dd>
+      </dl>
+    </div>
+  </article>
+
+  <ng-template #balanceSkeleton>
+    <div
+      *ngIf="initialLoadDone"
+      class="mb-8 rounded-lg border border-dashed border-slate-300 bg-white p-6 text-sm text-slate-500"
+      data-testid="balance-empty"
+    >
+      No se pudo cargar el saldo del plan. Vuelve a intentar más tarde.
+    </div>
+  </ng-template>
+
+  <!-- Daily usage chart -->
+  <article
+    class="mb-8 rounded-lg border border-slate-200 bg-white p-6 shadow-sm"
+    data-testid="daily-chart"
+  >
+    <header class="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+      <div>
+        <h2 class="text-sm font-medium uppercase tracking-wide text-slate-500">
+          Mensajes por día
+        </h2>
+        <p class="mt-1 text-xs text-slate-500">
+          <ng-container *ngIf="dailySince && dailyUntil; else dailyDefault">
+            Período {{ formatDay(dailySince) }} – {{ formatDay(dailyUntil) }}
+          </ng-container>
+          <ng-template #dailyDefault>
+            Cargando…
+          </ng-template>
+        </p>
+      </div>
+      <p class="text-xs text-slate-500" data-testid="daily-total">
+        Total: {{ dailySeries.length }} días
+      </p>
+    </header>
+
+    <div
+      *ngIf="dailySeries.length > 0; else dailyEmpty"
+      class="flex h-40 items-end gap-1"
+      data-testid="daily-chart-bars"
+    >
+      <div
+        *ngFor="let point of dailySeries; trackBy: trackDay"
+        class="flex flex-1 flex-col items-center justify-end"
+        [attr.data-testid]="'daily-bar'"
+        [attr.aria-label]="formatDay(point.day) + ': ' + point.count + ' mensajes'"
+      >
+        <span class="mb-1 text-[10px] font-medium text-slate-600">
+          {{ point.count }}
+        </span>
+        <div
+          class="w-full rounded-t bg-brand-500"
+          [style.height.%]="dailyBarHeight(point.count)"
+        ></div>
+        <span class="mt-1 text-[10px] text-slate-500">
+          {{ formatDay(point.day) }}
+        </span>
+      </div>
+    </div>
+
+    <ng-template #dailyEmpty>
+      <div
+        *ngIf="initialLoadDone"
+        class="flex h-40 items-center justify-center text-sm text-slate-500"
+        data-testid="daily-chart-empty"
+      >
+        Aún no has enviado mensajes este período.
+      </div>
+    </ng-template>
+  </article>
+
+  <!-- Filters -->
+  <form
+    [formGroup]="filtersForm"
+    class="mb-6 grid grid-cols-1 gap-4 rounded-lg border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-2 lg:grid-cols-5"
+    data-testid="filters-form"
+  >
+    <label class="flex flex-col text-xs font-medium text-slate-600">
+      Canal
+      <select
+        formControlName="channel"
+        class="mt-1 rounded-md border-slate-300 text-sm"
+        data-testid="filter-channel"
+      >
+        <option value="">Todos</option>
+        <option value="sms">SMS</option>
+        <option value="whatsapp">WhatsApp</option>
+      </select>
+    </label>
+    <label class="flex flex-col text-xs font-medium text-slate-600">
+      Estado
+      <select
+        formControlName="status"
+        class="mt-1 rounded-md border-slate-300 text-sm"
+        data-testid="filter-status"
+      >
+        <option value="">Todos</option>
+        <option value="pending">Pendiente</option>
+        <option value="queued">En cola</option>
+        <option value="sent">Enviado</option>
+        <option value="delivered">Entregado</option>
+        <option value="failed">Fallido</option>
+        <option value="unknown">Desconocido</option>
+      </select>
+    </label>
+    <label class="flex flex-col text-xs font-medium text-slate-600">
+      Desde
+      <input
+        type="date"
+        formControlName="since"
+        class="mt-1 rounded-md border-slate-300 text-sm"
+        data-testid="filter-since"
+      />
+    </label>
+    <label class="flex flex-col text-xs font-medium text-slate-600">
+      Hasta
+      <input
+        type="date"
+        formControlName="until"
+        class="mt-1 rounded-md border-slate-300 text-sm"
+        data-testid="filter-until"
+      />
+    </label>
+    <div class="flex items-end">
+      <button
+        type="button"
+        (click)="clearFilters()"
+        class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+        data-testid="filter-clear"
+      >
+        Limpiar filtros
+      </button>
+    </div>
+  </form>
+
+  <!-- Error banner -->
+  <div
+    *ngIf="errorMessage"
+    class="mb-4 rounded-md border border-rose-300 bg-rose-50 p-3 text-sm text-rose-800"
+    role="alert"
+    data-testid="error-banner"
+  >
+    {{ errorMessage }}
+  </div>
+
+  <!-- History table -->
+  <div
+    class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"
+    data-testid="history-table"
+  >
+    <table class="min-w-full divide-y divide-slate-200 text-sm">
+      <thead class="bg-slate-50 text-left text-xs font-medium uppercase tracking-wide text-slate-500">
+        <tr>
+          <th class="px-4 py-3">Fecha</th>
+          <th class="px-4 py-3">Canal</th>
+          <th class="px-4 py-3">Destino</th>
+          <th class="px-4 py-3">Mensaje</th>
+          <th class="px-4 py-3">Estado</th>
+          <th class="px-4 py-3 text-right">Costo</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-200">
+        <tr
+          *ngFor="let row of rows; trackBy: trackRow"
+          [attr.data-testid]="'history-row'"
+        >
+          <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+            {{ formatDate(row.created_at) }}
+          </td>
+          <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+            {{ channel(row) }}
+          </td>
+          <td
+            class="whitespace-nowrap px-4 py-3 font-mono text-xs text-slate-700"
+            [title]="row.to_number"
+          >
+            {{ destination(row) }}
+          </td>
+          <td class="max-w-xs truncate px-4 py-3 text-slate-600" [title]="row.body">
+            {{ row.body }}
+          </td>
+          <td class="whitespace-nowrap px-4 py-3">
+            <span
+              class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+              [ngClass]="statusBadgeClass(row)"
+              [attr.data-testid]="'status-' + row.status"
+            >
+              {{ status(row) }}
+            </span>
+          </td>
+          <td class="whitespace-nowrap px-4 py-3 text-right text-slate-700">
+            ${{ row.cost_clp | number }}
+          </td>
+        </tr>
+        <tr *ngIf="initialLoadDone && rows.length === 0 && !loading">
+          <td colspan="6" class="px-4 py-12 text-center text-sm text-slate-500" data-testid="history-empty">
+            No se encontraron mensajes con los filtros actuales.
+          </td>
+        </tr>
+        <tr *ngIf="loading">
+          <td colspan="6" class="px-4 py-12 text-center text-sm text-slate-500" data-testid="history-loading">
+            Cargando historial…
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Pagination -->
+  <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-600">
+    <p data-testid="history-summary">
+      Mostrando {{ rows.length }} de {{ totalRows | number }} mensajes
+    </p>
+    <div class="flex items-center gap-2">
+      <button
+        *ngIf="hasMore"
+        type="button"
+        (click)="loadMore()"
+        [disabled]="loading"
+        class="rounded-md border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        data-testid="load-more"
+      >
+        Cargar más
+      </button>
+      <button
+        type="button"
+        (click)="exportCsv()"
+        [disabled]="exporting"
+        class="inline-flex items-center gap-1.5 rounded-md border border-brand-600 bg-white px-3 py-1.5 font-medium text-brand-700 hover:bg-brand-50 disabled:opacity-50"
+        data-testid="export-csv"
+      >
+        <span aria-hidden="true">⬇</span>
+        <span>{{ exporting ? 'Descargando…' : 'Descargar CSV' }}</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Invoice history -->
+  <section
+    class="mt-12"
+    data-testid="invoices-section"
+  >
+    <header class="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+      <div>
+        <h2 class="text-lg font-semibold text-slate-900">Historial de facturación</h2>
+        <p class="mt-1 text-xs text-slate-500">
+          Facturas electrónicas emitidas por la plataforma.
+        </p>
+      </div>
+    </header>
+
+    <div
+      class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"
+      data-testid="invoices-table"
+    >
+      <table class="min-w-full divide-y divide-slate-200 text-sm">
+        <thead class="bg-slate-50 text-left text-xs font-medium uppercase tracking-wide text-slate-500">
+          <tr>
+            <th class="px-4 py-3">Número</th>
+            <th class="px-4 py-3">Período</th>
+            <th class="px-4 py-3">Emitida</th>
+            <th class="px-4 py-3">Vencimiento</th>
+            <th class="px-4 py-3 text-right">Mensajes</th>
+            <th class="px-4 py-3 text-right">Total</th>
+            <th class="px-4 py-3">Estado</th>
+            <th class="px-4 py-3">DTE</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-200">
+          <tr
+            *ngFor="let invoice of invoices; trackBy: trackInvoice"
+            [attr.data-testid]="'invoice-row'"
+          >
+            <td class="whitespace-nowrap px-4 py-3 font-mono text-xs text-slate-700">
+              {{ invoice.number }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+              {{ formatDay(invoice.period_start) }} – {{ formatDay(invoice.period_end) }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+              {{ formatDay(invoice.issue_date) }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+              {{ formatDay(invoice.due_date) }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-right text-slate-700">
+              {{ invoice.total_msgs | number }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-right font-medium text-slate-900">
+              ${{ invoice.total_clp | number }}
+            </td>
+            <td class="whitespace-nowrap px-4 py-3">
+              <span
+                class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+                [ngClass]="invoiceBadge(invoice.status)"
+                [attr.data-testid]="'invoice-status-' + invoice.status"
+              >
+                {{ invoiceStatus(invoice.status) }}
+              </span>
+            </td>
+            <td class="whitespace-nowrap px-4 py-3 text-slate-600">
+              <a
+                *ngIf="invoice.dte_url; else noDte"
+                [href]="invoice.dte_url"
+                target="_blank"
+                rel="noopener"
+                class="text-brand-700 hover:text-brand-800"
+              >
+                Ver PDF
+              </a>
+              <ng-template #noDte>
+                <span class="text-slate-400">—</span>
+              </ng-template>
+            </td>
+          </tr>
+          <tr *ngIf="initialLoadDone && invoices.length === 0">
+            <td
+              colspan="8"
+              class="px-4 py-12 text-center text-sm text-slate-500"
+              data-testid="invoices-empty"
+            >
+              Aún no se han emitido facturas.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</section>

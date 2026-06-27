@@ -1,33 +1,44 @@
 import { Component } from '@angular/core';
+import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 
 /**
  * Root component.
  *
- * Intentionally minimal: the dashboard layout, navigation, and
- * feature views will land in later tasks. This component is what
- * `bootstrapApplication` mounts into `<app-root>` (see `index.html`).
+ * The component owns the document chrome (header + the
+ * "ir al panel" link) and delegates the page body to
+ * :class:`<router-outlet>`. The "Historial y consumo"
+ * dashboard mounts as the first routed view; future
+ * screens (API Keys, factura, etc.) will land as
+ * siblings of the same outlet without further changes
+ * to the root template.
  */
 @Component({
   selector: 'app-root',
   standalone: true,
+  imports: [RouterLink, RouterLinkActive, RouterOutlet],
   template: `
-    <main class="mx-auto max-w-3xl px-6 py-12">
-      <header class="mb-8">
-        <h1 class="text-3xl font-semibold text-brand-700">Message Gateway</h1>
-        <p class="mt-2 text-slate-600">
-          Plataforma CPaaS chilena · API unificada de SMS y WhatsApp.
-        </p>
-      </header>
+    <header class="border-b border-slate-200 bg-white">
+      <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+        <a routerLink="/usage" class="flex items-center gap-2 text-brand-700">
+          <span class="text-lg font-semibold">Message Gateway</span>
+          <span class="hidden text-xs text-slate-500 sm:inline">
+            · Plataforma CPaaS chilena
+          </span>
+        </a>
+        <nav>
+          <a
+            routerLink="/usage"
+            routerLinkActive="text-brand-700 font-semibold"
+            [routerLinkActiveOptions]="{ exact: false }"
+            class="text-sm font-medium text-slate-600 hover:text-slate-900"
+          >
+            Historial y consumo
+          </a>
+        </nav>
+      </div>
+    </header>
 
-      <section class="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
-        <h2 class="text-lg font-medium">Estado del scaffold</h2>
-        <p class="mt-2 text-sm text-slate-600">
-          El frontend Angular está conectado al backend FastAPI.
-          Las pantallas de API Keys, mensajes y facturación se
-          entregarán en tareas posteriores.
-        </p>
-      </section>
-    </main>
+    <router-outlet />
   `,
 })
 export class AppComponent {}
