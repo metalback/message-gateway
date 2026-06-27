@@ -29,6 +29,14 @@ from app.adapters.errors import (
     ProviderUnavailableError,
     ProviderValidationError,
 )
+from app.adapters.flow import (
+    FlowClient,
+    FlowError,
+    FlowOrder,
+    FlowPaymentStatus,
+    FlowRejectionError,
+    FlowUnavailableError,
+)
 from app.adapters.registry import (
     UnsupportedChannelError,
     get_provider,
@@ -37,6 +45,12 @@ from app.adapters.registry import (
 
 __all__ = (
     "BaseProvider",
+    "FlowClient",
+    "FlowError",
+    "FlowOrder",
+    "FlowPaymentStatus",
+    "FlowRejectionError",
+    "FlowUnavailableError",
     "ProviderError",
     "ProviderRateLimitError",
     "ProviderUnavailableError",

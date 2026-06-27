@@ -6,7 +6,9 @@ Each public surface lives in its own submodule:
 - `templates.py`  – WhatsApp template CRUD
 - `webhooks.py`   – delivery receipt subscriptions
 - `auth.py`       – registration, login, API key rotation
-- `billing.py`    – balance and invoice history
+- `billing.py`    – plan catalog, subscription switching, invoice
+                     computation, Flow payment creation, and the
+                     Flow webhook reconciliation endpoint
 
 The :func:`register_routers` helper in ``app.api`` is the single
 mount point the application factory iterates over; adding a new

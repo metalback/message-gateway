@@ -179,14 +179,14 @@ def test_placeholder_routes_return_not_implemented() -> None:
     exists, the feature doesn't yet. The auth ``/register`` and
     ``/login`` endpoints are no longer placeholders (issue #3),
     and the message-sending endpoints are no longer placeholders
-    (issue #4), so they are excluded from this list."""
+    (issue #4), and the billing endpoints are no longer placeholders
+    (issue #7), so they are excluded from this list."""
     app = create_app(Settings())
     client = TestClient(app)
 
     cases = (
         ("GET", "/v1/templates", 501),
         ("GET", "/v1/webhooks", 501),
-        ("GET", "/v1/billing/balance", 501),
     )
     for method, path, expected_status in cases:
         response = client.request(method, path)

@@ -18,14 +18,26 @@ location to discover the full set of tables in the database.
 
 from app.models.base import Base
 from app.models.client import Client, ClientPlan, ClientStatus
-from app.models.message import Channel, Message, MessageStatus
+from app.models.invoice import Invoice, InvoiceStatus, InvoiceType
+from app.models.message import BILLABLE_STATUSES, Channel, Message, MessageChannel, MessageStatus
+from app.models.payment import Payment, PaymentStatus
+from app.models.plan import Plan, PlanBillingPeriod
 
 __all__ = (
     "Base",
+    "BILLABLE_STATUSES",
     "Channel",
     "Client",
     "ClientPlan",
     "ClientStatus",
+    "Invoice",
+    "InvoiceStatus",
+    "InvoiceType",
     "Message",
+    "MessageChannel",
     "MessageStatus",
+    "Payment",
+    "PaymentStatus",
+    "Plan",
+    "PlanBillingPeriod",
 )

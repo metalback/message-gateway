@@ -86,7 +86,8 @@ class Settings(BaseSettings):
         default="dev-phone-id", alias="META_WHATSAPP_PHONE_NUMBER_ID"
     )
     meta_whatsapp_api_base: str = Field(
-        default="https://graph.facebook.com", alias="META_WHATSAPP_API_BASE"
+        default="https://graph.facebook.com",
+        alias="META_WHATSAPP_API_BASE",
     )
     meta_whatsapp_api_version: str = Field(default="v22.0", alias="META_WHATSAPP_API_VERSION")
 
@@ -109,6 +110,94 @@ class Settings(BaseSettings):
     # works for the SMS aggregator.
     provider_timeout_seconds: float = Field(
         default=10.0, alias="PROVIDER_TIMEOUT_SECONDS", ge=1.0, le=60.0
+    )
+
+    # --- Billing --------------------------------------------------------
+    # Currency used for invoicing. The PRD locks the platform to
+    # CLP (Chilean Pesos) for the MVP; the field is exposed so a
+    # future "USD for international tenants" rollout is a config
+    # change, not a code change.
+    billing_currency: str = Field(default="CLP", alias="BILLING_CURRENCY")
+    # Chilean IVA rate. 0.19 = 19% - the standard rate the SII
+    # publishes for 2024+ (and historically; the rate has been
+    # stable for over a decade). The value is exposed so a
+    # deployment can re-rate to ``0.0`` for a tax-exempt scenario
+    # (e.g. exports) without touching the service layer.
+    billing_iva_rate: float = Field(default=0.19, alias="BILLING_IVA_RATE", ge=0.0, le=1.0)
+    # Number of days the customer has to pay an invoice after
+    # it's issued. The PRD says "mensual" (monthly) so 30 is
+    # the natural default; the field exists to honour "prepaid
+    # enterprise contracts" (where ``due_days=0`` makes the
+    # invoice due immediately).
+    billing_due_days: int = Field(default=30, alias="BILLING_DUE_DAYS", ge=0, le=365)
+    # Default plan code assigned to a freshly-registered client
+    # when the registration body omits one. Mirrors
+    # :class:`app.models.client.ClientPlan.STARTER` but is
+    # resolved against the :class:`~app.models.plan.Plan` table
+    # - a misconfiguration here surfaces as a 422 on
+    # ``POST /v1/auth/register`` rather than a silent row.
+    billing_default_plan_code: str = Field(
+        default="starter", alias="BILLING_DEFAULT_PLAN_CODE"
+    )
+
+    # --- Flow (payment processor) --------------------------------------
+    # Flow is the Chilean payment gateway (Webpay / Onepay /
+    # international cards). Credentials are sandbox-only by
+    # default; production deployments must set every alias.
+    flow_api_key: str = Field(default="", alias="FLOW_API_KEY")
+    flow_secret_key: str = Field(default="", alias="FLOW_SECRET_KEY")
+    # Base URL of the Flow API. The sandbox
+    # (``https://sandbox.flow.cl/api``) is wired by default;
+    # production swaps to ``https://www.flow.cl/api`` via
+    # ``FLOW_BASE_URL``.
+    flow_base_url: str = Field(
+        default="https://sandbox.flow.cl/api", alias="FLOW_BASE_URL"
+    )
+    # ``sandbox`` keeps the public_key encryption / token
+    # generation on Flow's test infrastructure; ``production``
+    # hits the real Webpay endpoint. The field is consumed by
+    # the Flow adapter to decide which idempotency / signing
+    # rules apply.
+    flow_environment: str = Field(default="sandbox", alias="FLOW_ENVIRONMENT")
+    # URL the customer is redirected to after a successful
+    # payment. Must be a URL the platform controls (or a
+    # frontend route that consumes the ``?token=...`` query
+    # parameter and polls the payment status).
+    flow_confirmation_url: str = Field(
+        default="https://app.msg-gateway.cl/billing/return",
+        alias="FLOW_CONFIRMATION_URL",
+    )
+    # Where Flow sends the customer if they cancel the payment.
+    flow_return_url: str = Field(
+        default="https://app.msg-gateway.cl/billing/cancel",
+        alias="FLOW_RETURN_URL",
+    )
+    # The platform's webhook endpoint. Flow POSTs the
+    # asynchronous payment confirmation here.
+    flow_webhook_url: str = Field(
+        default="https://api.msg-gateway.cl/v1/billing/webhook/flow",
+        alias="FLOW_WEBHOOK_URL",
+    )
+
+    # --- DTE (Documento Tributario Electrónico) --------------------------
+    # The platform's legal identity as the invoice issuer.
+    dte_emisor_rut: str = Field(default="76.123.456-7", alias="DTE_EMISOR_RUT")
+    dte_emisor_razon_social: str = Field(
+        default="Message Gateway SpA", alias="DTE_EMISOR_RAZON_SOCIAL"
+    )
+    dte_emisor_giro: str = Field(
+        default="Servicios de Telecomunicaciones", alias="DTE_EMISOR_GIRO"
+    )
+    dte_emisor_direccion: str = Field(
+        default="Av. Apoquindo 4711, Piso 12", alias="DTE_EMISOR_DIRECCION"
+    )
+    dte_emisor_comuna: str = Field(default="Las Condes", alias="DTE_EMISOR_COMUNA")
+    dte_emisor_ciudad: str = Field(default="Santiago", alias="DTE_EMISOR_CIUDAD")
+    dte_resolution_number: int = Field(default=0, alias="DTE_RESOLUTION_NUMBER")
+    dte_resolution_date: str = Field(
+        default="2024-01-01", alias="DTE_RESOLUTION_DATE"
+    )
+    dte_sii_office: str = Field(default="Santiago Oriente", alias="DTE_SII_OFFICE")
     )
 
     # --- Pydantic config ------------------------------------------------

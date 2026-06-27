@@ -85,6 +85,12 @@ class MessageStatus(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+# Channel / status values that count towards the monthly invoice.
+BILLABLE_STATUSES: frozenset[str] = frozenset(
+    {MessageStatus.SENT, MessageStatus.DELIVERED}
+)
+
+
 class Message(Base):
     """A single outbound SMS / WhatsApp message.
 
@@ -190,6 +196,9 @@ class Message(Base):
         nullable=True,
         onupdate=func.now(),
     )
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return (
@@ -228,4 +237,4 @@ Index(
 )
 
 
-__all__ = ("Channel", "Message", "MessageStatus")
+__all__ = ("BILLABLE_STATUSES", "Channel", "Message", "MessageStatus")
