@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime
 from typing import TypeVar
 
-from sqlalchemy import DateTime, String, TypeDecorator, func
+from sqlalchemy import DateTime, Float, Integer, String, TypeDecorator, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -139,6 +139,27 @@ class ClientPlan(enum.StrEnum):
     ENTERPRISE = "enterprise"
 
 
+class ClientRole(enum.StrEnum):
+    """Authorization role the platform assigns to a :class:`Client`.
+
+    The MVP supports two values:
+
+    - :attr:`CLIENT` – a regular customer. Default for every
+      fresh registration (``POST /v1/auth/register``). Has
+      access to the customer-facing ``/v1/*`` surface and the
+      per-customer dashboard.
+    - :attr:`ADMIN` – a platform operator. Has access to the
+      ``/v1/admin/*`` surface for client management, aggregated
+      metrics and the error log. The value is stored as a
+      ``String`` (via :class:`_StringEnum`) so a future
+      ``support`` / ``read_only`` role can land without a
+      schema change.
+    """
+
+    CLIENT = "client"
+    ADMIN = "admin"
+
+
 class Client(Base):
     """A registered customer of the platform.
 
@@ -211,6 +232,36 @@ class Client(Base):
         default=ClientStatus.ACTIVE,
     )
 
+    # --- Authorization role --------------------------------------------
+    # Drives the :func:`app.routes.admin.require_admin` dependency.
+    # Defaults to :attr:`ClientRole.CLIENT` so the regular
+    # registration path is unchanged. The initial admin is
+    # seeded by Alembic migration ``0005_admin_role_and_markup``
+    # (and the docs walk through the manual SQL alternative for
+    # an environment that bootstraps a fresh database from a
+    # non-migration entry point).
+    role: Mapped[ClientRole] = mapped_column(
+        _StringEnum(ClientRole, length=20),
+        nullable=False,
+        default=ClientRole.CLIENT,
+        index=True,
+    )
+
+    # --- Per-client pricing (issue #10) --------------------------------
+    # ``markup_percent`` is the percentage fee the platform
+    # adds on top of the provider's cost (a value of ``0.25``
+    # means "charge 25% above cost"). ``markup_fixed_clp`` is
+    # a flat CLP surcharge the customer pays per billable
+    # message. Both default to ``0`` so the pricing engine
+    # used by the customer-facing billing flow is unchanged
+    # unless an operator deliberately turns them on.
+    markup_percent: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0
+    )
+    markup_fixed_clp: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
     # --- Timestamps ------------------------------------------------------
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -226,7 +277,7 @@ class Client(Base):
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return (
             f"Client(id={self.id!r}, email={self.email!r}, "
-            f"plan={self.plan!r}, status={self.status!r})"
+            f"plan={self.plan!r}, status={self.status!r}, role={self.role!r})"
         )
 
     def __init__(self, **kwargs: object) -> None:

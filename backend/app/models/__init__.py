@@ -18,7 +18,7 @@ location to discover the full set of tables in the database.
 
 from app.models.base import Base
 from app.models.batch import Batch, BatchStatus
-from app.models.client import Client, ClientPlan, ClientStatus
+from app.models.client import Client, ClientPlan, ClientRole, ClientStatus
 from app.models.invoice import Invoice, InvoiceStatus, InvoiceType
 from app.models.message import BILLABLE_STATUSES, Channel, Message, MessageStatus
 from app.models.payment import Payment, PaymentStatus
@@ -38,6 +38,7 @@ __all__ = (
     "Channel",
     "Client",
     "ClientPlan",
+    "ClientRole",
     "ClientStatus",
     "DEFAULT_EVENTS",
     "Invoice",
