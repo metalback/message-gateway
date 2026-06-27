@@ -231,7 +231,9 @@ def _parse_send_response(response: httpx.Response, *, provider_name: str) -> Sen
             f"{provider_name} response missing message id: {data!r}",
             provider=provider_name,
         )
-    return SendResult(provider_msg_id=provider_msg_id, raw=data)
+    return SendResult(
+        provider_msg_id=provider_msg_id, raw=data, provider_name=provider_name
+    )
 
 
 def _truncate(value: str, *, limit: int = 200) -> str:

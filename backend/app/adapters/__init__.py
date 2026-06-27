@@ -17,9 +17,15 @@ Modules in this package:
                             the :class:`SendResult` dataclass.
 - ``errors.py``           – provider-specific exception types
                             (unavailable, validation, rate limit).
+- ``failover.py``         – :class:`FailoverProvider`, an adapter
+                            that wraps an ordered list of providers
+                            and falls back on retryable errors.
+- ``flow.py``             – Flow (payment gateway) client.
 - ``meta_whatsapp.py``    – Meta Cloud API adapter (WhatsApp).
 - ``sms_aggregator.py``   – local Chilean SMS aggregator.
-- ``registry.py``         – channel → adapter factory mapping.
+- ``registry.py``         – channel → adapter factory mapping,
+                            honours the failover chain configured
+                            in ``Settings.provider_failover_chains``.
 """
 
 from app.adapters.base import BaseProvider, SendResult
@@ -29,6 +35,7 @@ from app.adapters.errors import (
     ProviderUnavailableError,
     ProviderValidationError,
 )
+from app.adapters.failover import RETRYABLE_ERRORS, FailoverProvider
 from app.adapters.flow import (
     FlowClient,
     FlowError,
@@ -39,12 +46,15 @@ from app.adapters.flow import (
 )
 from app.adapters.registry import (
     UnsupportedChannelError,
+    UnsupportedProviderError,
     get_provider,
+    register_failover_provider,
     supported_channels,
 )
 
 __all__ = (
     "BaseProvider",
+    "FailoverProvider",
     "FlowClient",
     "FlowError",
     "FlowOrder",
@@ -55,8 +65,11 @@ __all__ = (
     "ProviderRateLimitError",
     "ProviderUnavailableError",
     "ProviderValidationError",
+    "RETRYABLE_ERRORS",
     "SendResult",
     "UnsupportedChannelError",
+    "UnsupportedProviderError",
     "get_provider",
+    "register_failover_provider",
     "supported_channels",
 )
