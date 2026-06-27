@@ -123,6 +123,20 @@ class Message(Base):
         index=True,
     )
 
+    # Optional foreign key to the :class:`app.models.batch.Batch`
+    # this message belongs to. ``None`` for the single-message
+    # path (``POST /v1/messages``); set for every item submitted
+    # through ``POST /v1/messages/batch`` (issue #9). Indexed
+    # because the counter-recompute query that runs after every
+    # batch send and every delivery-receipt update groups the
+    # ``mensajes`` table by ``batch_id``.
+    batch_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("lotes.id"),
+        nullable=True,
+        index=True,
+    )
+
     # --- Routing ---------------------------------------------------------
     # The provider name (``"meta_whatsapp"`` / ``"sms_aggregator"`` …)
     # is recorded so an operator can investigate a misroute without

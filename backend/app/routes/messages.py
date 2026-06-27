@@ -17,7 +17,18 @@ Implements the public surface documented in the PRD:
 - ``GET  /v1/messages/export`` – CSV download of the same
                                   history (issue #6 follow-up).
 - ``POST /v1/messages``        – send a single message.
-- ``POST /v1/messages/batch``  – send a batch of messages.
+- ``POST /v1/messages/batch``  – send a batch of messages
+                                  (issue #9). Returns the
+                                  new ``batch_id`` plus a
+                                  per-item result list and a
+                                  summary rollup.
+- ``GET  /v1/messages/batch``  – list the authenticated
+                                  customer's batches
+                                  (dashboard's "Campañas"
+                                  view), newest first.
+- ``GET  /v1/messages/batch/{id}`` – read the current state
+                                       of a single batch
+                                       (counters + lifecycle).
 - ``GET  /v1/messages/{id}``   – read the current status of a
                                   message (refreshing the
                                   provider's view if the row
@@ -46,13 +57,17 @@ from app.adapters.errors import (
     ProviderValidationError,
 )
 from app.db import get_db
+from app.models.batch import Batch, BatchStatus
 from app.models.client import Client
 from app.models.message import Channel, Message, MessageStatus
 from app.routes.auth import require_api_key
 from app.services.messaging import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_LIST_LIMIT,
+    BatchListPage,
+    BatchNotFoundError,
     BatchOutcome,
+    BatchSummary,
     BatchTooLargeError,
     DailyUsagePage,
     InvalidListFilterError,
@@ -64,8 +79,10 @@ from app.services.messaging import (
     MessagingError,
     SendOutcome,
     daily_message_counts,
+    get_batch,
     get_message_status,
     iter_messages_for_export,
+    list_batches,
     list_messages,
     message_status_summary,
     render_messages_csv,
@@ -145,17 +162,144 @@ class BatchRequest(BaseModel):
     service layer also enforces a hard upper bound so a
     malicious client cannot enqueue thousands of rows by
     accident.
+
+    ``name`` is an optional human-readable label
+    (e.g. "Black Friday 2026") the dashboard renders
+    on the "Campañas" view. Optional so a one-off
+    campaign can land without forcing the caller to
+    pick a name.
     """
 
     items: conlist(  # type: ignore[valid-type]
         BatchItem, min_length=1, max_length=DEFAULT_BATCH_SIZE
     )
+    name: str | None = Field(default=None, max_length=200)
+
+
+class BatchSummaryResponse(BaseModel):
+    """The headline counters of a :class:`Batch`.
+
+    Mirrors :class:`app.services.messaging.BatchSummary`
+    so the dashboard can render the values directly on
+    the "campañas" widget without re-iterating the
+    per-item results.
+
+    ``succeeded`` is the number of items that reached a
+    terminal state (``delivered + failed``); a caller
+    that just wants "how many made it through?" can
+    read the single field instead of summing the other
+    two.
+    """
+
+    total: int
+    pending: int
+    delivered: int
+    failed: int
+    succeeded: int
 
 
 class BatchResponse(BaseModel):
-    """Response of a successful ``POST /v1/messages/batch``."""
+    """Response of a successful ``POST /v1/messages/batch``.
 
+    ``batch_id`` – the id of the
+                   :class:`app.models.batch.Batch` row
+                   the call created. The caller can
+                   poll it through
+                   ``GET /v1/messages/batch/{batch_id}``
+                   to check progress.
+    ``summary``  – rollup counters the dashboard
+                   surfaces on the "campañas" view.
+    ``results``  – per-item outcome in the same order
+                   as the request. A failed item
+                   (``status=failed``) does not abort
+                   the rest of the batch; the caller can
+                   retry just the failures.
+    """
+
+    batch_id: str
+    summary: BatchSummaryResponse
     results: list[MessageResponse]
+
+
+class BatchListItemResponse(BaseModel):
+    """Projection of a :class:`app.models.batch.Batch` row
+    for the public API.
+
+    The shape is the same as the ``BatchResponse`` summary
+    block plus the lifecycle fields the dashboard needs to
+    render the "Campañas" view.
+    """
+
+    id: str
+    name: str | None
+    status: BatchStatus
+    total_count: int
+    pending_count: int
+    delivered_count: int
+    failed_count: int
+    created_at: datetime
+    updated_at: datetime | None
+    completed_at: datetime | None
+
+
+class BatchListResponse(BaseModel):
+    """Response of a successful ``GET /v1/messages/batch``.
+
+    The shape mirrors :class:`MessageListResponse` so the
+    dashboard's "Campañas" view can reuse the same
+    pagination component the "Historial" view already uses.
+    """
+
+    items: list[BatchListItemResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class BatchDetailResponse(BaseModel):
+    """Response of a successful ``GET /v1/messages/batch/{id}``.
+
+    Wraps a :class:`BatchListItemResponse` so a future
+    iteration can add envelope metadata (rate-limit
+    counters, the per-item results of a fresh
+    re-compute, …) without breaking the existing
+    client contract.
+    """
+
+    batch: BatchListItemResponse
+
+
+# ---------------------------------------------------------------------------
+# Batch helpers
+# ---------------------------------------------------------------------------
+
+
+def _batch_to_response(batch: Batch) -> BatchListItemResponse:
+    """Project a :class:`Batch` row to a :class:`BatchListItemResponse`."""
+    return BatchListItemResponse(
+        id=batch.id,
+        name=batch.name,
+        status=batch.status,
+        total_count=batch.total_count,
+        pending_count=batch.pending_count,
+        delivered_count=batch.delivered_count,
+        failed_count=batch.failed_count,
+        created_at=batch.created_at,
+        updated_at=batch.updated_at,
+        completed_at=batch.completed_at,
+    )
+
+
+def _summary_to_response(summary: BatchSummary) -> BatchSummaryResponse:
+    """Project a :class:`BatchSummary` to a :class:`BatchSummaryResponse`."""
+    return BatchSummaryResponse(
+        total=summary.total,
+        pending=summary.pending,
+        delivered=summary.delivered,
+        failed=summary.failed,
+        succeeded=summary.succeeded,
+    )
 
 
 class MessageListResponse(BaseModel):
@@ -367,17 +511,25 @@ async def send_batch_endpoint(
     """Send a batch of messages.
 
     The endpoint dispatches the items sequentially and
-    returns one result per item. A failure on item ``N`` does
-    not abort the batch: each item has its own row, and a
-    failed row carries the error code in ``error_code`` /
+    returns one result per item plus a rollup summary
+    (total / pending / delivered / failed / succeeded).
+    A failure on item ``N`` does not abort the batch:
+    each item has its own row, and a failed row carries
+    the error code in ``error_code`` /
     ``error_message`` so the caller can retry just the
     failures.
+
+    The response carries a ``batch_id`` the caller can
+    poll through ``GET /v1/messages/batch/{batch_id}``
+    to check progress. The id is also visible in the
+    dashboard's "Campañas" view.
     """
     try:
         outcome: BatchOutcome = await send_batch(
             session,
             client=current_client,
             items=[item.model_dump() for item in payload.items],
+            name=payload.name,
         )
     except (InvalidMessageError, BatchTooLargeError) as exc:
         _raise_messaging_error(exc)
@@ -389,7 +541,110 @@ async def send_batch_endpoint(
         _raise_provider_error(exc)
     except ProviderError as exc:
         _raise_provider_error(exc)
-    return BatchResponse(results=[_to_response(item.message) for item in outcome.results])
+    return BatchResponse(
+        batch_id=outcome.batch_id,
+        summary=_summary_to_response(outcome.summary),
+        results=[_to_response(item.message) for item in outcome.results],
+    )
+
+
+@router.get(
+    "/batch",
+    response_model=BatchListResponse,
+    responses={
+        200: {"description": "A page of the customer's batch history, newest first."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        422: {"description": "The filter values failed validation."},
+    },
+)
+async def list_batches_endpoint(
+    batch_status: BatchStatus | None = Query(
+        default=None,
+        alias="status",
+        description="Restrict the listing to a single batch lifecycle state.",
+    ),
+    limit: int = Query(
+        default=DEFAULT_LIST_LIMIT,
+        ge=1,
+        description="Page size; capped server-side at the list hard limit.",
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Number of rows to skip (for pagination).",
+    ),
+    current_client: Client = Depends(require_api_key),
+    session: AsyncSession = Depends(get_db),
+) -> BatchListResponse:
+    """List the authenticated customer's batch history.
+
+    The endpoint is the backend for the dashboard's
+    "Campañas" view: a paginated, filterable list of
+    every campaign the customer has submitted through
+    ``POST /v1/messages/batch``. The result is ordered
+    newest first, so the dashboard does not have to
+    re-sort on the client.
+
+    The endpoint never crosses the tenant boundary: a
+    customer can only see their own batches.
+    """
+    try:
+        page: BatchListPage = await list_batches(
+            session,
+            client=current_client,
+            status=batch_status,
+            limit=limit,
+            offset=offset,
+        )
+    except InvalidListFilterError as exc:
+        _raise_messaging_error(exc)
+    return BatchListResponse(
+        items=[_batch_to_response(batch) for batch in page.items],
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
+        has_more=page.has_more,
+    )
+
+
+@router.get(
+    "/batch/{batch_id}",
+    response_model=BatchDetailResponse,
+    responses={
+        200: {"description": "The current state of the batch."},
+        401: {"description": "The X-API-Key header is missing or invalid."},
+        404: {"description": "The batch does not exist (or belongs to another client)."},
+    },
+)
+async def get_batch_endpoint(
+    batch_id: str,
+    current_client: Client = Depends(require_api_key),
+    session: AsyncSession = Depends(get_db),
+) -> BatchDetailResponse:
+    """Read the current state of a single batch.
+
+    The endpoint recomputes the batch's counters on the
+    way out so a campaign that has been receiving
+    delivery receipts asynchronously through the webhook
+    loop still shows up-to-date numbers when the
+    customer opens the dashboard.
+
+    Cross-tenant access is blocked by the
+    ``client_id`` WHERE clause in the service layer: a
+    batch that belongs to a different client is reported
+    as 404 (the same response an unauthenticated caller
+    would see) so the existence of another tenant's
+    campaign is not leaked.
+    """
+    try:
+        batch = await get_batch(
+            session,
+            client=current_client,
+            batch_id=batch_id,
+        )
+    except BatchNotFoundError as exc:
+        _raise_messaging_error(exc)
+    return BatchDetailResponse(batch=_batch_to_response(batch))
 
 
 @router.get(

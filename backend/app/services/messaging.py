@@ -21,7 +21,17 @@ Public functions:
 - :func:`send_batch`    – persist + dispatch up to N messages
                           in one call (the hard cap is enforced
                           here so the route layer does not have
-                          to care).
+                          to care). Returns a
+                          :class:`BatchOutcome` carrying the
+                          ``batch_id`` the caller can poll
+                          through :func:`get_batch` /
+                          :func:`list_batches`.
+- :func:`get_batch`     – read a single batch with its latest
+                          counters. Cross-tenant access is
+                          reported as :class:`BatchNotFoundError`.
+- :func:`list_batches`  – paginated read of the authenticated
+                          customer's batch history, ordered
+                          newest first.
 - :func:`get_message_status` – read a message's current state
                                 from the database, refreshing
                                 the provider status if the
@@ -71,6 +81,7 @@ from app.adapters.base import SendResult
 from app.adapters.errors import ProviderError
 from app.adapters.registry import get_provider
 from app.config import Settings, get_settings
+from app.models.batch import Batch, BatchStatus
 from app.models.client import Client, ClientPlan
 from app.models.message import Channel, Message, MessageStatus
 from app.observability import normalise_phone
@@ -186,6 +197,15 @@ class BatchTooLargeError(MessagingError):
     code = "batch_too_large"
 
 
+class BatchNotFoundError(MessagingError):
+    """The requested batch id does not exist (or belongs to a
+    different client – the error is the same so we do not leak
+    the existence of someone else's resource)."""
+
+    http_status = 404
+    code = "batch_not_found"
+
+
 class InvalidListFilterError(MessagingError):
     """The history query carries an invalid filter value.
 
@@ -224,12 +244,91 @@ class SendOutcome:
 class BatchOutcome:
     """Outcome of a :func:`send_batch` call.
 
-    ``results`` – per-item outcome in the same order as the
-                  request. The route layer uses this to render
-                  the ``results`` array in the response.
+    ``batch_id``     – UUID of the :class:`app.models.batch.Batch`
+                       row the call created. The route layer
+                       surfaces it in the response so the caller
+                       can poll progress through
+                       :func:`get_batch` / :func:`list_batches`.
+    ``results``      – per-item outcome in the same order as
+                       the request. The route layer uses this
+                       to render the ``results`` array in the
+                       response.
+    ``summary``      – rollup counters the route layer projects
+                       onto the response so a caller can render
+                       a "X delivered / Y failed" widget
+                       without re-iterating the results.
     """
 
+    batch_id: str
     results: list[SendOutcome]
+    summary: BatchSummary
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """Headline counters of a :class:`Batch`.
+
+    The dashboard renders the values directly on the
+    "campañas" view without re-aggregating the underlying
+    ``mensajes`` table. The fields are kept flat (no nested
+    object) so the route layer can project them straight
+    onto a Pydantic response model.
+
+    ``total``        – number of items the caller submitted.
+                       Mirrors :attr:`Batch.total_count`.
+    ``pending``      – items still in flight. Mirrors
+                       :attr:`Batch.pending_count`.
+    ``delivered``    – items that reached ``delivered``. Mirrors
+                       :attr:`Batch.delivered_count`.
+    ``failed``       – items that ended up ``failed``. Mirrors
+                       :attr:`Batch.failed_count`.
+    ``succeeded``    – ``delivered + failed`` items. Computed
+                       here so a caller that just wants
+                       "how many made it through?" does not
+                       have to re-derive the value.
+    """
+
+    total: int
+    pending: int
+    delivered: int
+    failed: int
+
+    @property
+    def succeeded(self) -> int:
+        """Return the number of items that reached a terminal state.
+
+        Defined as ``delivered + failed`` so the value is in
+        sync with the underlying ``Batch`` row (a counter
+        recompute sets the batch to ``completed`` when
+        ``pending`` hits zero, which is exactly the condition
+        where ``total == succeeded``).
+        """
+        return self.delivered + self.failed
+
+
+@dataclass(frozen=True)
+class BatchListPage:
+    """A single page of a customer's batch history.
+
+    The shape mirrors :class:`MessageListPage` – the dashboard
+    iterates the two with the same "items / total / has_more"
+    idiom so a new feature ("campañas" view) can reuse the
+    existing pagination component without a second code path.
+
+    ``items``      – batches on this page, newest first.
+    ``total``      – total number of batches matching the
+                     filter across the full history.
+    ``limit``      – the page size that was applied.
+    ``offset``     – the offset that was applied.
+    ``has_more``   – ``True`` when at least one more batch
+                     exists after this page.
+    """
+
+    items: list[Batch]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
 
 
 @dataclass(frozen=True)
@@ -457,6 +556,7 @@ async def _persist_message(
     to: str,
     body: str,
     settings: Settings,
+    batch_id: str | None = None,
 ) -> Message:
     """Create and persist a :class:`Message` row in ``pending`` state.
 
@@ -464,6 +564,12 @@ async def _persist_message(
     this helper just makes sure the row exists with the right
     defaults so the worker's "pick up pending messages" query
     can find it.
+
+    ``batch_id`` is ``None`` for the single-message path
+    (``POST /v1/messages``); the batch path always sets it so
+    every message it produces is grouped under the
+    :class:`app.models.batch.Batch` row the same call
+    creates.
     """
     cost, fee = compute_message_cost(channel=channel, plan=client.plan)
     message = Message(
@@ -475,6 +581,7 @@ async def _persist_message(
         status=MessageStatus.PENDING,
         cost_clp=cost,
         fee_clp=fee,
+        batch_id=batch_id,
     )
     session.add(message)
     await session.flush()  # populate server defaults
@@ -553,6 +660,7 @@ async def send_message(
     to: str,
     body: str,
     settings: Settings | None = None,
+    batch_id: str | None = None,
 ) -> SendOutcome:
     """Persist + dispatch a single message and return the outcome.
 
@@ -560,6 +668,12 @@ async def send_message(
     successful ``POST /v1/messages`` is durable even if the
     worker that picks up the delivery receipt crashes in
     parallel.
+
+    ``batch_id`` is ``None`` for the single-message path; the
+    batch path always passes the id of the
+    :class:`app.models.batch.Batch` row it just created so
+    every message in the batch is grouped under the same
+    parent.
     """
     cfg = settings or get_settings()
     canonical_to = _validate_destination(channel, to)
@@ -572,6 +686,7 @@ async def send_message(
         to=canonical_to,
         body=canonical_body,
         settings=cfg,
+        batch_id=batch_id,
     )
     # Flush + commit before the network call: a failed
     # dispatch must not roll back the row (the worker / ops
@@ -603,6 +718,7 @@ async def send_batch(
     client: Client,
     items: list[dict[str, str]],
     settings: Settings | None = None,
+    name: str | None = None,
 ) -> BatchOutcome:
     """Persist + dispatch a batch of messages.
 
@@ -611,6 +727,23 @@ async def send_batch(
     (``channel``, ``to``, ``body``). The hard cap is enforced
     before any persistence work so a malicious client cannot
     enqueue thousands of rows by accident.
+
+    The function groups every message under a fresh
+    :class:`app.models.batch.Batch` row, then returns the
+    :class:`BatchOutcome` so the route layer can surface the
+    ``batch_id`` in the response. A future iteration can swap
+    the inline ``await`` for "persist with status=``pending``
+    and let the worker pick it up" without changing the
+    route handler.
+
+    Cross-item isolation: a single bad item (``invalid_channel``
+    / ``body_too_long`` …) raises before the loop runs, so the
+    whole batch is rejected and the caller's retry policy
+    stays simple. A per-item provider failure (rate limit,
+    upstream down) is recorded on the row (``status=failed``)
+    but does **not** abort the batch – a campaign with one
+    bad number should still let the other 99 messages
+    through.
     """
     cfg = settings or get_settings()
     if not isinstance(items, list):
@@ -623,6 +756,40 @@ async def send_batch(
             f"batch size {len(items)} exceeds the hard limit of {_BATCH_HARD_LIMIT}",
         )
 
+    # Pre-validate the channel of every item so a single bad
+    # channel does not abort the batch *after* half the
+    # messages have been persisted. The Pydantic model on the
+    # route layer already catches this case, but the worker /
+    # in-process caller does not necessarily go through the
+    # route, so the check has to live here too.
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise InvalidMessageError(
+                "invalid_batch",
+                f"item {index} is not an object",
+            )
+        try:
+            Channel(str(item.get("channel", "")))
+        except ValueError as exc:
+            raise InvalidMessageError("invalid_channel", str(exc)) from exc
+
+    # Create the Batch row up-front so every message can
+    # carry its ``batch_id`` and the counters can be updated
+    # in the same transaction. The ``total_count`` is frozen
+    # at submission time so the dashboard can render "X of Y"
+    # without re-deriving the denominator.
+    batch = Batch(
+        client_id=client.id,
+        name=(name or None),
+        total_count=len(items),
+        pending_count=len(items),
+        delivered_count=0,
+        failed_count=0,
+        status=BatchStatus.PROCESSING,
+    )
+    session.add(batch)
+    await session.flush()  # populate ``batch.id`` so messages can FK it
+
     outcomes: list[SendOutcome] = []
     for item in items:
         # We dispatch sequentially so a single bad item does
@@ -630,10 +797,7 @@ async def send_batch(
         # worker (added in a follow-up task) will run batches
         # in parallel; the synchronous path here is the
         # "one-shot" behaviour the API edge advertises.
-        try:
-            channel = Channel(item.get("channel", ""))
-        except ValueError as exc:
-            raise InvalidMessageError("invalid_channel", str(exc)) from exc
+        channel = Channel(str(item.get("channel", "")))
         outcome = await send_message(
             session,
             client=client,
@@ -641,9 +805,244 @@ async def send_batch(
             to=item.get("to", ""),
             body=item.get("body", ""),
             settings=cfg,
+            batch_id=batch.id,
         )
         outcomes.append(outcome)
-    return BatchOutcome(results=outcomes)
+
+    # All messages have reached a terminal state
+    # (``sent`` / ``failed``) by the time ``send_message``
+    # returns, so the counter recompute is the last step
+    # before the route layer surfaces the response.
+    await _recompute_batch_counters(session, batch=batch)
+    await session.commit()
+    await session.refresh(batch)
+
+    return BatchOutcome(
+        batch_id=batch.id,
+        results=outcomes,
+        summary=BatchSummary(
+            total=batch.total_count,
+            pending=batch.pending_count,
+            delivered=batch.delivered_count,
+            failed=batch.failed_count,
+        ),
+    )
+
+
+async def _recompute_batch_counters(session: AsyncSession, *, batch: Batch) -> None:
+    """Recompute the denormalised counters on a :class:`Batch` row.
+
+    The single source of truth for the counters is the
+    underlying ``mensajes`` table – the values on
+    ``batch`` are denormalised so the dashboard can render
+    "X of Y delivered" without an aggregate query on every
+    read. The recompute is a single ``GROUP BY status`` over
+    the messages of one batch; the cost is one indexed read
+    on the ``(batch_id, status)`` path the future worker
+    will own.
+
+    The function also flips :attr:`Batch.status` to
+    :class:`BatchStatus.COMPLETED` (or :class:`BatchStatus.FAILED`
+    when every item ended up ``failed``) so a polling
+    dashboard can detect a finished campaign without
+    inspecting the per-item counters.
+    """
+    stmt = (
+        select(Message.status, func.count(Message.id))
+        .where(Message.batch_id == batch.id)
+        .group_by(Message.status)
+    )
+    rows = (await session.execute(stmt)).all()
+
+    pending = 0
+    delivered = 0
+    failed = 0
+    for raw_status, raw_count in rows:
+        # The ``MessageStatus`` column round-trips through
+        # the ``_StringEnum`` decorator, so the row value
+        # is either a :class:`MessageStatus` member or a
+        # ``str`` (the SQLAlchemy core path). We accept both.
+        count = int(raw_count or 0)
+        if isinstance(raw_status, MessageStatus):
+            status = raw_status
+        else:
+            try:
+                status = MessageStatus(str(raw_status))
+            except ValueError:
+                status = MessageStatus.UNKNOWN
+        if status == MessageStatus.DELIVERED:
+            delivered += count
+        elif status == MessageStatus.FAILED:
+            failed += count
+        else:
+            # ``pending`` / ``queued`` / ``sent`` / ``unknown``
+            # are all "in flight" from the batch's point of
+            # view. The dashboard does not split them at the
+            # batch level – the per-status breakdown is on
+            # the per-message history endpoint.
+            pending += count
+
+    batch.pending_count = pending
+    batch.delivered_count = delivered
+    batch.failed_count = failed
+
+    # Status transition: ``completed`` once no item is in
+    # flight; ``failed`` if every item ended up ``failed``
+    # (no partial success – useful for the dashboard's
+    # "campaña fallida" filter).
+    if pending == 0 and batch.total_count > 0:
+        if delivered == 0 and failed > 0:
+            batch.status = BatchStatus.FAILED
+        else:
+            batch.status = BatchStatus.COMPLETED
+        # ``completed_at`` is set the first time the batch
+        # reaches a terminal state. A second call (e.g. a
+        # re-compute from a delivery-receipt webhook arriving
+        # after the batch was already marked completed) leaves
+        # the timestamp untouched so the value is "when did
+        # the batch finish?", not "when was the last
+        # counter recompute?".
+        if batch.completed_at is None:
+            from datetime import datetime as _dt
+
+            batch.completed_at = _dt.now(tz=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Batch lookup
+# ---------------------------------------------------------------------------
+
+
+async def get_batch(
+    session: AsyncSession,
+    *,
+    client: Client,
+    batch_id: str,
+    settings: Settings | None = None,
+) -> Batch:
+    """Return a single :class:`Batch` row, recomputing its
+    counters on the way out.
+
+    The cross-tenant access guard reports an unknown id the
+    same way :func:`get_message_status` does: a batch that
+    belongs to a different client is reported as
+    :class:`BatchNotFoundError` (the same response an
+    unauthenticated caller would see) so the existence of
+    another tenant's campaign is not leaked.
+
+    The counters are recomputed (rather than read straight
+    off the row) so a campaign that has been receiving
+    delivery receipts asynchronously through the webhook
+    loop still shows up-to-date numbers when the customer
+    opens the dashboard.
+    """
+    _ = settings  # kept for symmetry with the rest of the service
+    if not isinstance(batch_id, str) or not batch_id:
+        raise BatchNotFoundError("batch_not_found", "batch id is required")
+    stmt = select(Batch).where(Batch.id == batch_id)
+    result = await session.execute(stmt)
+    batch = result.scalar_one_or_none()
+    if batch is None or batch.client_id != client.id:
+        raise BatchNotFoundError("batch_not_found", "batch does not exist")
+
+    # A recompute is one indexed ``GROUP BY status`` over
+    # the messages of one batch. The cost is bounded by the
+    # hard cap on the batch (``_BATCH_HARD_LIMIT``) so even
+    # a campaign at the limit is a sub-millisecond read.
+    await _recompute_batch_counters(session, batch=batch)
+    if batch.pending_count == 0 and batch.total_count > 0:
+        # The row is dirty until we commit. The caller (the
+        # route layer) will commit via the dependency; we
+        # flush here so the in-memory copy is in sync with
+        # the SQL we just ran.
+        await session.commit()
+    await session.refresh(batch)
+    return batch
+
+
+async def list_batches(
+    session: AsyncSession,
+    *,
+    client: Client,
+    status: object | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    settings: Settings | None = None,
+) -> BatchListPage:
+    """Return a paginated slice of the customer's batch history.
+
+    Mirrors :func:`list_messages` (same ``limit`` / ``offset``
+    semantics, same ``total`` / ``has_more`` projection) so
+    the dashboard's "campañas" view can reuse the same
+    pagination component the "historial" view already uses.
+
+    The result is ordered by ``created_at`` descending so the
+    most recent campaign is the first row of the response –
+    the dashboard does not have to re-sort on the client.
+    """
+    _ = settings  # kept for symmetry with the rest of the service
+    if not isinstance(client, Client):
+        raise InvalidListFilterError("invalid_client", "client is required")
+    status_filter = _normalise_batch_status_filter(status)
+    limit = _coerce_int(limit, field="limit", minimum=1)
+    offset = _coerce_int(offset, field="offset", minimum=0)
+    if limit > _LIST_HARD_LIMIT:
+        limit = _LIST_HARD_LIMIT
+
+    where: list[ColumnElement[bool]] = [Batch.client_id == client.id]
+    if status_filter is not None:
+        where.append(Batch.status == status_filter)
+
+    list_stmt = (
+        select(Batch)
+        .where(and_(*where))
+        .order_by(Batch.created_at.desc(), Batch.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    count_stmt = select(func.count(Batch.id)).where(and_(*where))
+
+    list_result = await session.execute(list_stmt)
+    items = list(list_result.scalars().all())
+    count_result = await session.execute(count_stmt)
+    total = int(count_result.scalar_one() or 0)
+    has_more = (offset + len(items)) < total
+
+    return BatchListPage(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+    )
+
+
+def _normalise_batch_status_filter(value: object) -> BatchStatus | None:
+    """Return the :class:`BatchStatus` matching ``value`` or ``None``.
+
+    Same contract as :func:`_normalise_channel_filter` /
+    :func:`_normalise_status_filter`: ``None`` / empty string
+    means "no filter"; an unknown value raises
+    :class:`InvalidListFilterError` so the route layer can
+    surface a 422 instead of silently returning an empty
+    list.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, BatchStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return BatchStatus(value)
+        except ValueError as exc:
+            raise InvalidListFilterError(
+                "invalid_batch_status",
+                f"unknown batch status filter: {value!r}",
+            ) from exc
+    raise InvalidListFilterError(
+        "invalid_batch_status",
+        "batch status filter must be a string",
+    )
 
 
 async def get_message_status(
@@ -1477,7 +1876,10 @@ def _coerce_day(value: object) -> date:
 
 
 __all__ = (
+    "BatchListPage",
+    "BatchNotFoundError",
     "BatchOutcome",
+    "BatchSummary",
     "BatchTooLargeError",
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_LIST_LIMIT",
@@ -1494,8 +1896,10 @@ __all__ = (
     "SendOutcome",
     "compute_message_cost",
     "daily_message_counts",
+    "get_batch",
     "get_message_status",
     "iter_messages_for_export",
+    "list_batches",
     "list_messages",
     "message_status_summary",
     "render_messages_csv",
