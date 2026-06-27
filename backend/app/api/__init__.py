@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.routes import auth, billing, messages, templates, webhooks
+from app.routes import admin, auth, billing, messages, templates, webhooks
 
 # Routers are registered eagerly so the public API surface is
 # discoverable from a single import. Each module exposes a
@@ -22,6 +22,7 @@ _ROUTERS = (
     webhooks.router,
     auth.router,
     billing.router,
+    admin.router,
 )
 
 
