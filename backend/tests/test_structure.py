@@ -180,15 +180,13 @@ def test_placeholder_routes_return_not_implemented() -> None:
     ``/login`` endpoints are no longer placeholders (issue #3),
     the message-sending endpoints are no longer placeholders
     (issue #4), the billing endpoints are no longer placeholders
-    (issue #7), and the webhook endpoints are no longer
-    placeholders (issue #5) – so they are excluded from this
-    list."""
+    (issue #7), the webhook endpoints are no longer placeholders
+    (issue #5), and the WhatsApp-template endpoints are no longer
+    placeholders (issue #8), so they are excluded from this list."""
     app = create_app(Settings())
     client = TestClient(app)
 
-    cases = (
-        ("GET", "/v1/templates", 501),
-    )
+    cases: tuple[tuple[str, str, int], ...] = ()
     for method, path, expected_status in cases:
         response = client.request(method, path)
         assert (
@@ -261,5 +259,39 @@ def test_webhooks_endpoints_are_implemented() -> None:
     response = client.get("/v1/webhooks")
     assert response.status_code != 501, (
         "GET /v1/webhooks must be implemented (issue #5), "
+        "not the scaffold 501 placeholder"
+    )
+
+
+def test_templates_endpoints_are_implemented() -> None:
+    """The ``/v1/templates`` endpoints were 501 placeholders
+    until issue #8 landed; the test guards against a
+    regression that would re-introduce the 501 behaviour
+    now that the routes are real.
+
+    The request is intentionally missing a valid API key, so
+    the dependency short-circuits with a 401 (not a 501).
+    The assertion is the *not-501* half of the contract:
+    as long as the endpoint behaves like a real handler
+    (it consults the API-key dependency instead of
+    stubbing the response), the placeholder contract is
+    dead. We exercise ``POST`` (create) and ``GET`` (list)
+    so a regression that only flipped one of them would
+    still surface.
+    """
+    app = create_app(Settings())
+    client = TestClient(app)
+
+    create = client.post(
+        "/v1/templates",
+        json={"name": "order_confirmation", "language": "es_CL"},
+    )
+    assert create.status_code != 501, (
+        "POST /v1/templates must be implemented (issue #8), "
+        "not the scaffold 501 placeholder"
+    )
+    listing = client.get("/v1/templates")
+    assert listing.status_code != 501, (
+        "GET /v1/templates must be implemented (issue #8), "
         "not the scaffold 501 placeholder"
     )

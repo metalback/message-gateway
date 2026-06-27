@@ -23,6 +23,11 @@ from app.models.message import BILLABLE_STATUSES, Channel, Message, MessageStatu
 from app.models.payment import Payment, PaymentStatus
 from app.models.plan import Plan, PlanBillingPeriod
 from app.models.webhook import DEFAULT_EVENTS, Webhook, WebhookEvent
+from app.models.whatsapp_template import (
+    WhatsAppTemplate,
+    WhatsAppTemplateCategory,
+    WhatsAppTemplateStatus,
+)
 
 __all__ = (
     "Base",
@@ -43,4 +48,7 @@ __all__ = (
     "PlanBillingPeriod",
     "Webhook",
     "WebhookEvent",
+    "WhatsAppTemplate",
+    "WhatsAppTemplateCategory",
+    "WhatsAppTemplateStatus",
 )
