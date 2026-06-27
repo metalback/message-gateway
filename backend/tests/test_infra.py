@@ -247,6 +247,9 @@ EXPECTED_ENV_KEYS: set[str] = {
     "SMS_AGGREGATOR_API_KEY",
     "SMS_AGGREGATOR_SENDER_ID",
     "PROVIDER_TIMEOUT_SECONDS",
+    # Webhooks – delivery receipts (issue #5).
+    "WEBHOOK_DELIVERY_TIMEOUT_SECONDS",
+    "WEBHOOK_MAX_DELIVERY_ATTEMPTS",
     # Billing & Flow (issue #7).
     "BILLING_CURRENCY",
     "BILLING_IVA_RATE",

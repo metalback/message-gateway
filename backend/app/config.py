@@ -112,6 +112,29 @@ class Settings(BaseSettings):
         default=10.0, alias="PROVIDER_TIMEOUT_SECONDS", ge=1.0, le=60.0
     )
 
+    # --- Webhooks (delivery receipts) ----------------------------------
+    # Timeout (in seconds) for outbound POSTs the platform sends to
+    # customer-configured webhook URLs. Kept tighter than the
+    # provider timeout (5s vs 10s) so a misconfigured customer
+    # endpoint cannot stall the delivery worker for more than a
+    # short bounded interval.
+    webhook_delivery_timeout_seconds: float = Field(
+        default=5.0,
+        alias="WEBHOOK_DELIVERY_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=30.0,
+    )
+    # Maximum number of delivery attempts the platform will make
+    # for a single receipt before giving up. The exponential
+    # back-off is calculated by the service layer (no setting for
+    # it – the values are documented in the service module).
+    webhook_max_delivery_attempts: int = Field(
+        default=5,
+        alias="WEBHOOK_MAX_DELIVERY_ATTEMPTS",
+        ge=1,
+        le=10,
+    )
+
     # --- Billing --------------------------------------------------------
     # Currency used for invoicing. The PRD locks the platform to
     # CLP (Chilean Pesos) for the MVP; the field is exposed so a
@@ -198,7 +221,6 @@ class Settings(BaseSettings):
         default="2024-01-01", alias="DTE_RESOLUTION_DATE"
     )
     dte_sii_office: str = Field(default="Santiago Oriente", alias="DTE_SII_OFFICE")
-    )
 
     # --- Pydantic config ------------------------------------------------
     # `populate_by_name=True` lets tests instantiate `Settings(field="x")`
