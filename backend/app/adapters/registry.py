@@ -12,14 +12,27 @@ shipping a plugin loader would be over-engineering. A new
 provider is a three-step change:
 
 1. Implement :class:`BaseProvider` in a new module.
-2. Add a factory to :data:`_BUILDERS` below.
+2. Register a factory in :data:`_BUILDERS` below (keyed by
+   the provider's :attr:`BaseProvider.name`).
 3. Reference it from configuration (``Settings``).
 
-The mapping is keyed by :class:`~app.models.message.Channel`
-because the routing decision is "given a channel, which
-provider owns it?". Adding a new channel is therefore a
-breaking change that requires an Alembic migration anyway, so
-the registry does not need to support dynamic registration.
+Two levels of routing live in this module:
+
+- A *channel* map (:data:`_BUILDERS`) names the *primary*
+  provider for each channel – this is the pre-failover
+  behaviour the MVP shipped with and the default the platform
+  reverts to when no failover chain is configured.
+- A *failover* map (:data:`_FAILOVER_BUILDERS`) names any
+  extra providers that can be used as fallbacks. The
+  :class:`~app.adapters.failover.FailoverProvider` stitches
+  them together at :func:`get_provider` time.
+
+The mapping for primaries is keyed by
+:class:`~app.models.message.Channel` because the routing
+decision is "given a channel, which provider owns it?".
+Adding a new channel is therefore a breaking change that
+requires an Alembic migration anyway, so the registry does
+not need to support dynamic registration.
 """
 
 from __future__ import annotations
@@ -28,6 +41,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from app.adapters.base import BaseProvider
+from app.adapters.failover import FailoverProvider
 from app.models.message import Channel
 
 if TYPE_CHECKING:
@@ -41,8 +55,8 @@ if TYPE_CHECKING:
 # A factory receives the runtime :class:`Settings` and returns a
 # fully-configured adapter. The factories are kept module-private
 # so the rest of the codebase only ever calls :func:`get_provider`
-# – a public surface that the future "fallback" logic can extend
-# without breaking every call site.
+# – a public surface that wraps the failover logic without
+# exposing it to every call site.
 
 
 def _build_meta_whatsapp(settings: Settings) -> BaseProvider:
@@ -70,14 +84,44 @@ def _build_sms_aggregator(settings: Settings) -> BaseProvider:
     )
 
 
-# Channel → factory mapping. The keys must match the values of
-# :class:`app.models.message.Channel` exactly. A typo would
-# surface as a ``KeyError`` at the first send – acceptable
+# Channel → primary-factory mapping. The keys must match the
+# values of :class:`app.models.message.Channel` exactly. A typo
+# would surface as a ``KeyError`` at the first send – acceptable
 # failure mode for a configuration mistake.
 _BUILDERS: dict[Channel, Callable[[Settings], BaseProvider]] = {
     Channel.WHATSAPP: _build_meta_whatsapp,
     Channel.SMS: _build_sms_aggregator,
 }
+
+
+# Fallback-builder map keyed by ``BaseProvider.name``. The chain
+# resolver in :func:`_resolve_provider` uses this to look up the
+# factory for every name that appears in
+# ``Settings.provider_failover_chains``. An empty map means the
+# platform only knows the two primaries above – the MVP's pre-
+# failover surface area. A new fallback provider is added by
+# registering a factory here.
+_FAILOVER_BUILDERS: dict[str, Callable[[Settings], BaseProvider]] = {
+    "meta_whatsapp": _build_meta_whatsapp,
+    "sms_aggregator": _build_sms_aggregator,
+}
+
+
+def register_failover_provider(
+    name: str,
+    factory: Callable[[Settings], BaseProvider],
+) -> None:
+    """Register an additional fallback provider by name.
+
+    Public escape hatch used by tests (and by future "drop a new
+    Twilio adapter" tasks) to plug a new provider into the
+    failover chain without editing the registry. The MVP ships
+    only the two primaries above, so the helper is a no-op for
+    production callers – but keeping it on the module means
+    tests can extend the chain without monkey-patching
+    module-level globals.
+    """
+    _FAILOVER_BUILDERS[name] = factory
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +132,13 @@ _BUILDERS: dict[Channel, Callable[[Settings], BaseProvider]] = {
 def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
     """Return the provider that owns ``channel``.
 
-    The function is intentionally simple: look the channel up in
-    the registry, build the adapter from the runtime settings,
-    return it. A more sophisticated implementation would honour
-    fallback policies ("try Meta, fall back to a second
-    WhatsApp provider"), but that lands in a follow-up task
-    (see PRD follow-up list).
+    The function honours the failover configuration in
+    ``settings.provider_failover_chains``: when a chain is
+    configured for the channel the call returns a
+    :class:`~app.adapters.failover.FailoverProvider` that wraps
+    the named providers in order; otherwise it returns the
+    primary directly (the pre-failover behaviour, kept
+    bit-for-bit compatible with earlier releases).
 
     ``channel`` may be passed as a :class:`Channel` enum member
     (the production path) or as a plain string (useful for
@@ -114,13 +159,40 @@ def get_provider(channel: Channel | str, *, settings: Settings) -> BaseProvider:
                 channel=channel,  # type: ignore[arg-type]
             ) from exc
     try:
-        builder = _BUILDERS[channel]
+        primary_factory = _BUILDERS[channel]
     except KeyError as exc:
         raise UnsupportedChannelError(
             f"channel {channel!r} is not supported by any provider",
             channel=channel,
         ) from exc
-    return builder(settings)
+
+    chain_setting = settings.provider_failover_chains.get(channel.value)
+    primary = primary_factory(settings)
+    if not chain_setting:
+        return primary
+    # The primary must be the chain's first element – the
+    # failover contract is "primary first, then fallbacks". We
+    # drop a duplicate from the operator's list rather than
+    # erroring out, which mirrors the chain validator in
+    # :class:`FailoverProvider` (a duplicate does not add
+    # availability, but rejecting the whole config would block
+    # the platform on a typo).
+    primary_name = primary.name
+    chain_providers: list[BaseProvider] = [primary]
+    for name in chain_setting:
+        if name == primary_name:
+            continue
+        try:
+            factory = _FAILOVER_BUILDERS[name]
+        except KeyError as exc:
+            raise UnsupportedProviderError(
+                f"provider {name!r} is not registered for failover routing",
+                name=name,
+            ) from exc
+        chain_providers.append(factory(settings))
+    if len(chain_providers) == 1:
+        return primary
+    return FailoverProvider(chain_providers)
 
 
 def supported_channels() -> list[Channel]:
@@ -147,4 +219,27 @@ class UnsupportedChannelError(ValueError):
         self.channel = channel
 
 
-__all__ = ("UnsupportedChannelError", "get_provider", "supported_channels")
+class UnsupportedProviderError(ValueError):
+    """Raised when a failover chain references an unknown provider.
+
+    A :class:`ValueError` (configuration error) rather than a
+    provider-specific exception, mirroring
+    :class:`UnsupportedChannelError`. The route layer does not
+    surface this directly: the validator in
+    :class:`app.config.Settings` rejects a malformed chain at
+    boot, so the only path that reaches this exception is a
+    test that exercises the registry in isolation.
+    """
+
+    def __init__(self, message: str, *, name: str) -> None:
+        super().__init__(message)
+        self.name = name
+
+
+__all__ = (
+    "UnsupportedChannelError",
+    "UnsupportedProviderError",
+    "get_provider",
+    "register_failover_provider",
+    "supported_channels",
+)

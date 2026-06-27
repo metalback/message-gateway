@@ -247,6 +247,8 @@ EXPECTED_ENV_KEYS: set[str] = {
     "SMS_AGGREGATOR_API_KEY",
     "SMS_AGGREGATOR_SENDER_ID",
     "PROVIDER_TIMEOUT_SECONDS",
+    # Provider failover chains (issue #11).
+    "PROVIDER_FAILOVER_CHAINS",
     # Webhooks – delivery receipts (issue #5).
     "WEBHOOK_DELIVERY_TIMEOUT_SECONDS",
     "WEBHOOK_MAX_DELIVERY_ATTEMPTS",

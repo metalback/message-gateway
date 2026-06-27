@@ -15,6 +15,17 @@ returns. A future iteration can swap the inline ``await`` for
 "persist with status=``pending`` and let the worker pick it
 up" without changing the route handler.
 
+Provider failover (issue #11) is wired transparently through
+:func:`app.adapters.registry.get_provider`: when
+``Settings.provider_failover_chains`` names more than one
+provider for the channel, the registry returns a
+:class:`~app.adapters.failover.FailoverProvider` and the
+service treats it like any other adapter. The
+``Message.provider`` column records the *actual* upstream that
+handled the call (taken from
+:attr:`app.adapters.base.SendResult.provider_name`), so a
+operator can tell a failover happened just by reading the row.
+
 Public functions:
 
 - :func:`send_message`  – persist + dispatch a single message.
@@ -586,12 +597,29 @@ async def send_message(
         message.status = MessageStatus.FAILED
         message.error_code = exc.code
         message.error_message = exc.message[:500]
+        # If the failover wrapper re-raised a non-retryable
+        # error from one of its underlyings, the synthetic
+        # chain name in ``message.provider`` is misleading –
+        # the operator wants to know *which* upstream
+        # surfaced the rejection. ``exc.provider`` carries the
+        # underlying adapter's name (set by the concrete
+        # adapter) so we can keep the column accurate even
+        # on a failed dispatch.
+        if exc.provider and exc.provider != message.provider:
+            message.provider = exc.provider
         await session.commit()
         await session.refresh(message)
         return SendOutcome(message=message, provider_msg_id=None)
 
     message.status = MessageStatus.SENT
     message.provider_msg_id = result.provider_msg_id
+    # The failover router may have switched providers mid-call;
+    # ``result.provider_name`` carries the *actual* upstream that
+    # accepted the message so an operator looking at the
+    # ``Message.provider`` column can tell a failover happened.
+    actual_provider = result.provider_name or provider.name
+    if actual_provider != message.provider:
+        message.provider = actual_provider
     await session.commit()
     await session.refresh(message)
     return SendOutcome(message=message, provider_msg_id=result.provider_msg_id)
