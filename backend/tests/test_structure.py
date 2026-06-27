@@ -295,3 +295,45 @@ def test_templates_endpoints_are_implemented() -> None:
         "GET /v1/templates must be implemented (issue #8), "
         "not the scaffold 501 placeholder"
     )
+
+
+def test_batch_endpoints_are_implemented() -> None:
+    """The ``/v1/messages/batch`` endpoints were placeholders
+    (no ``batch_id`` rollup, no per-batch lookup, no batch
+    history listing) until issue #9 landed; the test guards
+    against a regression that would re-introduce the
+    minimal "POST only" contract.
+
+    As with :func:`test_messages_send_endpoint_is_implemented`,
+    the requests are intentionally missing a valid API key
+    so the dependency short-circuits with a 401 (not a 501).
+    The assertion is the *not-501* half of the contract: as
+    long as the endpoints behave like real handlers, the
+    placeholder contract is dead. We exercise ``POST``
+    (create), ``GET`` (list) and ``GET /{batch_id}`` (detail)
+    so a regression that only flipped one of them would
+    still surface.
+    """
+    app = create_app(Settings())
+    client = TestClient(app)
+
+    create = client.post(
+        "/v1/messages/batch",
+        json={"items": [{"channel": "sms", "to": "+56912345678", "body": "x"}]},
+    )
+    assert create.status_code != 501, (
+        "POST /v1/messages/batch must be implemented (issue #9), "
+        "not the scaffold 501 placeholder"
+    )
+    listing = client.get("/v1/messages/batch")
+    assert listing.status_code != 501, (
+        "GET /v1/messages/batch must be implemented (issue #9), "
+        "not the scaffold 501 placeholder"
+    )
+    detail = client.get(
+        "/v1/messages/batch/00000000-0000-0000-0000-000000000000"
+    )
+    assert detail.status_code != 501, (
+        "GET /v1/messages/batch/{id} must be implemented (issue #9), "
+        "not the scaffold 501 placeholder"
+    )
